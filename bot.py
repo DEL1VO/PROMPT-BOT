@@ -1,0 +1,1080 @@
+"""
+Telegram-бот «Получить промт» (aiogram 3.x)
+
+- Админ создаёт публикацию: текст/фото для канала + СВОЙ промт (в канале его нет)
+  + выбирает, на какие каналы/ботов нужно подписаться именно для этой публикации.
+- Бот публикует пост в канал с кнопкой «Получить промт» (deep-link ?start=p<ID>).
+- Пользователь нажимает кнопку -> бот определяет публикацию, проверяет подписки этой публикации
+  и присылает «Ваш промт 💛» + промт текстом (без фото) в <code>-блоке: нажатие копирует.
+  Если промт длиннее PROMPT_FILE_THRESHOLD символов — присылает его текстовым файлом .txt.
+
+Переменные окружения: BOT_TOKEN, ADMIN_IDS, DB_PATH (см. README.md)
+"""
+
+import asyncio
+import base64
+import hashlib
+import html
+import logging
+import os
+import sqlite3
+import tempfile
+import time
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("promt-bot")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+# промт длиннее этого числа символов отправляется текстовым файлом (.txt), а не сообщением
+FILE_THRESHOLD = int(os.getenv("PROMPT_FILE_THRESHOLD", "1500"))
+
+# ── Хранилище в GitHub (необязательно): бэкап базы в приватный репозиторий ──
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # owner/name
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "data")  # отдельная ветка: пуши не трогают код в main
+GITHUB_BASE_BRANCH = os.getenv("GITHUB_BASE_BRANCH", "main")  # от неё создаётся ветка данных
+DB_ENCRYPT_KEY = os.getenv("DB_ENCRYPT_KEY", "")  # секретная фраза: база шифруется перед загрузкой
+GITHUB_DB_FILE = os.getenv("GITHUB_DB_FILE", "bot.db.enc" if DB_ENCRYPT_KEY else "bot.db")
+BACKUP_INTERVAL = int(os.getenv("BACKUP_INTERVAL", "300"))  # секунд между проверками
+GITHUB_API = "https://api.github.com"
+GH_ENABLED = bool(GITHUB_TOKEN and GITHUB_REPO)
+_last_backup_hash = ""
+
+BOT_USERNAME = ""  # заполняется при старте
+
+router = Router()
+ADMIN = F.from_user.id.in_(ADMIN_IDS)
+
+
+# ───────────────────────────── База данных ─────────────────────────────
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_seen INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS posts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
+                photo TEXT,
+                prompt TEXT NOT NULL,
+                channel_id TEXT,
+                message_id INTEGER,
+                created INTEGER
+            );
+            -- каталог каналов и ботов, которые админ может требовать
+            CREATE TABLE IF NOT EXISTS subs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,          -- 'channel' | 'bot'
+                chat_id INTEGER,
+                title TEXT,
+                link TEXT NOT NULL
+            );
+            -- какие подписки нужны для конкретной публикации
+            CREATE TABLE IF NOT EXISTS post_subs(
+                post_id INTEGER,
+                sub_id INTEGER,
+                PRIMARY KEY(post_id, sub_id)
+            );
+            CREATE TABLE IF NOT EXISTS claims(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                post_id INTEGER,
+                ts INTEGER
+            );
+            """
+        )
+        cols = [r[1] for r in c.execute("PRAGMA table_info(subs)")]
+        if "token" not in cols:  # токен бота для настоящей проверки запуска (необязателен)
+            c.execute("ALTER TABLE subs ADD COLUMN token TEXT")
+
+
+# ───────────────────────────── Бэкап в GitHub ─────────────────────────────
+
+def _gh_headers(raw: bool = False) -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _gh_url() -> str:
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_DB_FILE}"
+
+
+_fernet = None
+
+
+def _crypto():
+    """Fernet из секретной фразы DB_ENCRYPT_KEY (или None, если шифрование выключено)."""
+    global _fernet
+    if not DB_ENCRYPT_KEY:
+        return None
+    if _fernet is None:
+        from cryptography.fernet import Fernet
+
+        key = hashlib.pbkdf2_hmac("sha256", DB_ENCRYPT_KEY.encode(), b"prompt-bot-db", 200_000)
+        _fernet = Fernet(base64.urlsafe_b64encode(key))
+    return _fernet
+
+
+async def _repo_is_private(http) -> bool:
+    async with http.get(f"{GITHUB_API}/repos/{GITHUB_REPO}", headers=_gh_headers()) as r:
+        r.raise_for_status()
+        return bool((await r.json()).get("private"))
+
+
+async def _ensure_branch(http) -> None:
+    """Создаёт ветку данных от основной, если её ещё нет."""
+    base = f"{GITHUB_API}/repos/{GITHUB_REPO}/git"
+    async with http.get(f"{base}/ref/heads/{GITHUB_BRANCH}", headers=_gh_headers()) as r:
+        if r.status == 200:
+            return
+        if r.status != 404:
+            r.raise_for_status()
+    async with http.get(f"{base}/ref/heads/{GITHUB_BASE_BRANCH}", headers=_gh_headers()) as r:
+        r.raise_for_status()
+        sha = (await r.json())["object"]["sha"]
+    async with http.post(
+        f"{base}/refs", json={"ref": f"refs/heads/{GITHUB_BRANCH}", "sha": sha}, headers=_gh_headers()
+    ) as r:
+        r.raise_for_status()
+    log.info("Создана ветка %s для данных", GITHUB_BRANCH)
+
+
+async def gh_restore() -> None:
+    """Если локальной базы нет — скачать её из GitHub."""
+    global _last_backup_hash
+    if not GH_ENABLED or os.path.exists(DB_PATH):
+        return
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(_gh_url(), params={"ref": GITHUB_BRANCH}, headers=_gh_headers(raw=True)) as r:
+                if r.status == 404:
+                    log.info("В GitHub бэкапа пока нет — начинаем с чистой базы")
+                    return
+                r.raise_for_status()
+                data = await r.read()
+        f = _crypto()
+        if f:
+            data = f.decrypt(data)
+        folder = os.path.dirname(DB_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(DB_PATH, "wb") as f:
+            f.write(data)
+        _last_backup_hash = hashlib.sha256(data).hexdigest()
+        log.info("База восстановлена из GitHub (%d байт)", len(data))
+    except Exception as e:
+        log.error("Не удалось восстановить базу из GitHub: %s", e)
+
+
+def _snapshot() -> bytes:
+    """Целостный снимок базы (безопасно, даже если бот сейчас пишет в неё)."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(tmp)
+
+
+async def gh_backup(force: bool = False) -> str:
+    """Загружает базу в GitHub, если она изменилась. Возвращает текст-статус."""
+    global _last_backup_hash
+    if not GH_ENABLED:
+        return "GitHub-бэкап не настроен (нет GITHUB_TOKEN / GITHUB_REPO)."
+    import aiohttp
+
+    try:
+        data = await asyncio.to_thread(_snapshot)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest == _last_backup_hash and not force:
+            return "Изменений нет."
+        async with aiohttp.ClientSession() as http:
+            if not DB_ENCRYPT_KEY and not await _repo_is_private(http):
+                return ("❌ Репозиторий публичный, а DB_ENCRYPT_KEY не задан — "
+                        "загружать базу открыто нельзя. Задайте DB_ENCRYPT_KEY.")
+            await _ensure_branch(http)
+            f = _crypto()
+            payload = f.encrypt(data) if f else data
+            sha = None
+            async with http.get(_gh_url(), params={"ref": GITHUB_BRANCH}, headers=_gh_headers()) as r:
+                if r.status == 200:
+                    sha = (await r.json()).get("sha")
+                elif r.status != 404:
+                    r.raise_for_status()
+            body = {
+                "message": f"backup {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "content": base64.b64encode(payload).decode(),
+                "branch": GITHUB_BRANCH,
+            }
+            if sha:
+                body["sha"] = sha
+            async with http.put(_gh_url(), json=body, headers=_gh_headers()) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"{r.status}: {(await r.text())[:200]}")
+        _last_backup_hash = digest
+        log.info("Бэкап в GitHub загружен (%d байт)", len(data))
+        return f"✅ Бэкап загружен в GitHub ({len(data) // 1024 + 1} КБ)."
+    except Exception as e:
+        log.error("Ошибка бэкапа в GitHub: %s", e)
+        return f"❌ Ошибка бэкапа: {e}"
+
+
+async def backup_loop() -> None:
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        await gh_backup()
+
+
+# ───────────────────────────── Состояния ─────────────────────────────
+
+class NewPost(StatesGroup):
+    content = State()
+    prompt = State()
+    subs = State()
+    channel = State()
+
+
+class AddChannel(StatesGroup):
+    wait = State()
+
+
+class AddBot(StatesGroup):
+    wait = State()
+    token = State()
+
+
+# ───────────────────────────── Вспомогательное ─────────────────────────────
+
+def admin_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Новая публикация", callback_data="adm:newpost")
+    kb.button(text="📋 Публикации", callback_data="adm:posts")
+    kb.button(text="📢 Каналы и боты для подписки", callback_data="adm:subs")
+    kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="adm:menu")]]
+    )
+
+
+def save_user(m: Message) -> None:
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users(user_id, username, first_seen) VALUES(?,?,?)",
+            (m.from_user.id, m.from_user.username, int(time.time())),
+        )
+
+
+_err_notified: dict[int, float] = {}
+
+
+async def notify_admins(bot: Bot, text: str) -> None:
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, text)
+        except Exception:
+            pass
+
+
+async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    try:
+        cm = await bot.get_chat_member(chat_id, user_id)
+    except Exception as e:
+        log.warning("get_chat_member(%s) failed: %s", chat_id, e)
+        # бот не видит канал (удалён из админов / канал удалён) — предупредим админа, не чаще раза в час
+        if time.time() - _err_notified.get(chat_id, 0) > 3600:
+            _err_notified[chat_id] = time.time()
+            await notify_admins(
+                bot,
+                f"⚠️ Не могу проверить подписку на канал <code>{chat_id}</code>: {html.escape(str(e))}\n"
+                "Возможно, бота удалили из админов канала. Пока это не исправлено, "
+                "пользователи не смогут получить промт.",
+            )
+        return False
+    if cm.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        return False
+    if cm.status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(cm, "is_member", True))
+    return True
+
+
+# ───────────────────── Чистка чата (удаление прошлых сообщений) ─────────────────────
+
+# служебные сообщения бота, которые нужно убрать при следующем действии: chat_id -> [message_id]
+_trash: dict[int, list[int]] = {}
+CLEAN_CMDS = {"/start", "/admin", "/cancel", "/backup"}
+
+
+async def reply(m: Message, text: str, **kw) -> Message:
+    """Ответ, который потом будет удалён функцией wipe()."""
+    sent = await m.answer(text, **kw)
+    _trash.setdefault(m.chat.id, []).append(sent.message_id)
+    return sent
+
+
+async def wipe(bot: Bot, chat_id: int) -> None:
+    """Удаляет предыдущие служебные сообщения бота в этом чате."""
+    for mid in _trash.pop(chat_id, []):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+class CleanupMiddleware(BaseMiddleware):
+    """После обработки удаляет команды и ответы админа в шагах мастера — чат остаётся чистым."""
+
+    async def __call__(self, handler, event: Message, data: dict):
+        result = await handler(event, data)
+        cmd = (event.text or "").split(maxsplit=1)[0].split("@")[0] if event.text else ""
+        if event.chat.type == "private" and (data.get("raw_state") or cmd in CLEAN_CMDS):
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        return result
+
+
+router.message.middleware(CleanupMiddleware())
+
+
+def split_text(text: str, limit: int = 3500) -> list[str]:
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts or [text]
+
+
+def post_subs(post_id: int) -> list[sqlite3.Row]:
+    with db() as c:
+        return c.execute(
+            "SELECT s.* FROM subs s JOIN post_subs ps ON ps.sub_id=s.id WHERE ps.post_id=? ORDER BY s.id",
+            (post_id,),
+        ).fetchall()
+
+
+async def missing_channels(bot: Bot, user_id: int, post_id: int) -> list[sqlite3.Row]:
+    res = []
+    for s in post_subs(post_id):
+        if s["kind"] == "channel" and not await is_member(bot, s["chat_id"], user_id):
+            res.append(s)
+    return res
+
+
+_sub_bots: dict[str, Bot] = {}
+
+
+def _sub_bot(token: str) -> Bot:
+    """Клиент для бота из каталога (кэшируется, чтобы не создавать сессию на каждую проверку)."""
+    if token not in _sub_bots:
+        _sub_bots[token] = Bot(token)
+    return _sub_bots[token]
+
+
+async def bot_status(bot: Bot, sub: sqlite3.Row, user_id: int):
+    """True — человек запускал этого бота, False — нет (или остановил/заблокировал),
+    None — проверить нельзя (нет токена или ошибка), тогда работает кнопка «Готово»."""
+    if not sub["token"]:
+        return None
+    try:
+        await _sub_bot(sub["token"]).send_chat_action(user_id, "typing")
+        return True
+    except TelegramForbiddenError:
+        return False  # бота остановили/заблокировали
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            return False  # человек ещё не запускал бота
+        log.warning("проверка бота %s: %s", sub["title"], e)
+        return None
+    except TelegramUnauthorizedError:
+        key = -int(sub["id"])
+        if time.time() - _err_notified.get(key, 0) > 3600:
+            _err_notified[key] = time.time()
+            await notify_admins(bot, f"⚠️ Токен бота {html.escape(sub['title'])} не работает (сменили или отозвали). "
+                                     "Проверка запуска отключена, работает только кнопка «Готово». "
+                                     "Обновите токен в «Каналы и боты».")
+        return None
+    except Exception as e:
+        log.warning("проверка бота %s не удалась: %s", sub["title"], e)
+        return None
+
+
+async def send_prompt(bot: Bot, user_id: int, post_id: int, prompt: str) -> None:
+    """Короткий промт — текстом в <code>-блоке, длинный — текстовым файлом."""
+    if len(prompt) > FILE_THRESHOLD:
+        # utf-8-sig: BOM помогает Блокноту/Windows правильно открыть кириллицу
+        data = prompt.encode("utf-8-sig")
+        await bot.send_document(
+            user_id,
+            BufferedInputFile(data, filename=f"prompt_{post_id}.txt"),
+            caption="Ваш промт 💛\nОн длинный, поэтому прислан файлом — откройте и скопируйте текст.",
+        )
+        return
+    await bot.send_message(user_id, "Ваш промт 💛")
+    for chunk in split_text(prompt):
+        await bot.send_message(user_id, f"<code>{html.escape(chunk)}</code>")
+
+
+async def check_bots(bot: Bot, user_id: int, post_id: int):
+    """Возвращает (боты, которых человек точно не запускал; боты без возможности проверки)."""
+    not_started, manual = [], []
+    for sub in post_subs(post_id):
+        if sub["kind"] != "bot":
+            continue
+        st = await bot_status(bot, sub, user_id)
+        if st is False:
+            not_started.append(sub)
+        elif st is None:
+            manual.append(sub)
+    return not_started, manual
+
+
+async def process(bot: Bot, user_id: int, post_id: int, bots_confirmed: bool = False) -> None:
+    """Проверяет подписки публикации и выдаёт её промт (или просит подписаться)."""
+    await wipe(bot, user_id)  # убираем прошлые служебные сообщения (просьбу подписаться и т.п.)
+    with db() as c:
+        post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+    if not post:
+        sent = await bot.send_message(user_id, "😔 Эта публикация не найдена или была удалена.")
+        _trash.setdefault(user_id, []).append(sent.message_id)
+        return
+
+    missing = await missing_channels(bot, user_id, post_id)
+    not_started, manual = await check_bots(bot, user_id, post_id)
+
+    # боты с токеном проверяются по-настоящему; без токена — только по кнопке «Готово»
+    if missing or not_started or (manual and not bots_confirmed):
+        kb = InlineKeyboardBuilder()
+        for s in missing:
+            kb.button(text=f"📢 {s['title']}", url=s["link"])
+        for s in not_started + manual:
+            kb.button(text=f"🤖 {s['title']}", url=s["link"])
+        kb.button(text="✅ Готово", callback_data=f"check:{post_id}")
+        kb.adjust(1)
+        what = []
+        if missing:
+            what.append("подпишитесь на каналы")
+        if not_started or manual:
+            what.append("запустите ботов")
+        sent = await bot.send_message(
+            user_id,
+            f"Чтобы получить промт, {' и '.join(what)} ниже, затем нажмите «✅ Готово».",
+            reply_markup=kb.as_markup(),
+        )
+        _trash.setdefault(user_id, []).append(sent.message_id)
+        return
+
+    with db() as c:
+        c.execute("INSERT INTO claims(user_id, post_id, ts) VALUES(?,?,?)", (user_id, post_id, int(time.time())))
+    await send_prompt(bot, user_id, post_id, post["prompt"])
+
+
+# ───────────────────────────── Пользователи ─────────────────────────────
+
+@router.message(CommandStart())
+async def cmd_start(m: Message, command: CommandObject, state: FSMContext, bot: Bot):
+    await state.clear()
+    await wipe(bot, m.chat.id)
+    save_user(m)
+    arg = (command.args or "").strip()
+
+    if arg.startswith("p") and arg[1:].isdigit():
+        await process(bot, m.from_user.id, int(arg[1:]))
+        return
+
+    if m.from_user.id in ADMIN_IDS:
+        await reply(m, "👋 Админ-панель:", reply_markup=admin_menu())
+    else:
+        await reply(m, "Привет! Нажмите кнопку «Получить промт» под публикацией в канале 💛")
+
+
+@router.callback_query(F.data.startswith("check:"))
+async def cb_check(cb: CallbackQuery, bot: Bot):
+    post_id = int(cb.data.split(":")[1])
+    missing = await missing_channels(bot, cb.from_user.id, post_id)
+    not_started, _ = await check_bots(bot, cb.from_user.id, post_id)
+    if missing or not_started:
+        names = ", ".join(s["title"] for s in missing + not_started)
+        await cb.answer(f"Вы ещё не выполнили: {names} 🙈"[:200], show_alert=True)
+        return
+    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await process(bot, cb.from_user.id, post_id, bots_confirmed=True)
+
+
+# ───────────────────────────── Админка ─────────────────────────────
+
+@router.message(Command("admin"), ADMIN)
+async def cmd_admin(m: Message, state: FSMContext):
+    await state.clear()
+    await wipe(m.bot, m.chat.id)
+    await reply(m, "👋 Админ-панель:", reply_markup=admin_menu())
+
+
+@router.message(Command("backup"), ADMIN)
+async def cmd_backup(m: Message):
+    await reply(m, await gh_backup(force=True))
+
+
+@router.message(Command("cancel"), ADMIN)
+async def cmd_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await wipe(m.bot, m.chat.id)
+    await reply(m, "Отменено.", reply_markup=admin_menu())
+
+
+@router.callback_query(F.data == "adm:menu", ADMIN)
+async def cb_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("👋 Админ-панель:", reply_markup=admin_menu())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:stats", ADMIN)
+async def cb_stats(cb: CallbackQuery):
+    with db() as c:
+        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        posts = c.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        claims = c.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+        uniq = c.execute("SELECT COUNT(DISTINCT user_id) FROM claims").fetchone()[0]
+    await cb.message.edit_text(
+        f"📊 <b>Статистика</b>\n\nПользователей: {users}\nПубликаций: {posts}\n"
+        f"Выдач промта: {claims} (уникальных людей: {uniq})",
+        reply_markup=back_menu(),
+    )
+    await cb.answer()
+
+
+# ---------- Публикации ----------
+
+@router.callback_query(F.data == "adm:posts", ADMIN)
+async def cb_posts(cb: CallbackQuery):
+    with db() as c:
+        rows = c.execute(
+            """SELECT p.id, p.channel_id,
+                      (SELECT COUNT(*) FROM claims WHERE post_id=p.id) AS n,
+                      (SELECT COUNT(*) FROM post_subs WHERE post_id=p.id) AS s
+               FROM posts p ORDER BY p.id DESC LIMIT 15"""
+        ).fetchall()
+    if not rows:
+        await cb.message.edit_text("Публикаций пока нет.", reply_markup=back_menu())
+        return await cb.answer()
+    kb = InlineKeyboardBuilder()
+    lines = ["📋 <b>Последние публикации</b>\n"]
+    for r in rows:
+        names = ", ".join(html.escape(x["title"]) for x in post_subs(r["id"])) or "нет ⚠️"
+        lines.append(f"#{r['id']} → {r['channel_id']} · выдач: {r['n']}\n     подписки: {names}")
+        kb.button(text=f"✏️ Подписки #{r['id']}", callback_data=f"postsubs:{r['id']}")
+        kb.button(text=f"🗑 #{r['id']}", callback_data=f"postdel:{r['id']}")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(*([2] * len(rows)), 1)
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+async def show_post_subs(cb: CallbackQuery, pid: int) -> None:
+    with db() as c:
+        catalog = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    if not catalog:
+        await cb.message.edit_text(
+            "В каталоге нет каналов и ботов. Добавьте их в «📢 Каналы и боты для подписки».",
+            reply_markup=back_menu(),
+        )
+        return
+    chosen = {x["id"] for x in post_subs(pid)}
+    kb = InlineKeyboardBuilder()
+    for x in catalog:
+        icon = "📢" if x["kind"] == "channel" else "🤖"
+        mark = "✅" if x["id"] in chosen else "▫️"
+        kb.button(text=f"{mark} {icon} {x['title']}", callback_data=f"pst:{pid}:{x['id']}")
+    kb.button(text="⬅️ К публикациям", callback_data="adm:posts")
+    kb.adjust(1)
+    await cb.message.edit_text(
+        f"Подписки для публикации #{pid}.\nНажмите на канал/бота, чтобы включить или выключить. "
+        "Изменения действуют сразу.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("postsubs:"), ADMIN)
+async def cb_postsubs(cb: CallbackQuery):
+    await show_post_subs(cb, int(cb.data.split(":")[1]))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("pst:"), ADMIN)
+async def cb_pst(cb: CallbackQuery):
+    _, pid, sid = cb.data.split(":")
+    with db() as c:
+        has = c.execute("SELECT 1 FROM post_subs WHERE post_id=? AND sub_id=?", (pid, sid)).fetchone()
+        if has:
+            c.execute("DELETE FROM post_subs WHERE post_id=? AND sub_id=?", (pid, sid))
+        else:
+            c.execute("INSERT OR IGNORE INTO post_subs(post_id, sub_id) VALUES(?,?)", (pid, sid))
+    await show_post_subs(cb, int(pid))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("postdel:"), ADMIN)
+async def cb_postdel(cb: CallbackQuery, bot: Bot):
+    pid = int(cb.data.split(":")[1])
+    with db() as c:
+        p = c.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
+        c.execute("DELETE FROM posts WHERE id=?", (pid,))
+        c.execute("DELETE FROM post_subs WHERE post_id=?", (pid,))
+    if p and p["message_id"]:
+        try:
+            await bot.delete_message(p["channel_id"], p["message_id"])
+        except Exception:
+            pass
+    await cb.answer("Удалено (и из канала, если получилось)")
+    await cb_posts(cb)
+
+
+@router.callback_query(F.data == "adm:newpost", ADMIN)
+async def cb_newpost(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(NewPost.content)
+    await cb.message.edit_text(
+        "1/4. Пришлите <b>текст публикации</b> для канала (можно с фото и форматированием).\n"
+        "Отмена: /cancel"
+    )
+    await cb.answer()
+
+
+@router.message(NewPost.content, ADMIN)
+async def np_content(m: Message, state: FSMContext):
+    if m.photo:
+        await state.update_data(text=m.html_text if m.caption else "", photo=m.photo[-1].file_id)
+    elif m.text:
+        await state.update_data(text=m.html_text, photo=None)
+    else:
+        return await reply(m, "Нужен текст или фото с подписью.")
+    await state.set_state(NewPost.prompt)
+    await reply(m, 
+        "2/4. Пришлите <b>промт для этой публикации</b> обычным текстом (без фото) "
+        "или файлом <code>.txt</code>, если он очень длинный. "
+        "Его не будет в канале — пользователь получит его в боте после нажатия кнопки "
+        "(длинный промт придёт текстовым файлом)."
+    )
+
+
+def picker_kb(catalog: list[sqlite3.Row], chosen: set[int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for s in catalog:
+        icon = "📢" if s["kind"] == "channel" else "🤖"
+        mark = "✅" if s["id"] in chosen else "▫️"
+        kb.button(text=f"{mark} {icon} {s['title']}", callback_data=f"ps:t:{s['id']}")
+    kb.button(text="➡️ Далее", callback_data="ps:ok")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.message(NewPost.prompt, ADMIN, F.text | F.document)
+async def np_prompt(m: Message, state: FSMContext, bot: Bot):
+    if m.document:
+        if m.document.file_size and m.document.file_size > 1_000_000:
+            return await reply(m, "Файл слишком большой (максимум 1 МБ).")
+        buf = await bot.download(m.document)
+        raw = buf.read()
+        try:
+            prompt = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                prompt = raw.decode("cp1251")
+            except UnicodeDecodeError:
+                return await reply(m, "Не смог прочитать файл. Пришлите текстовый файл .txt в UTF-8.")
+        prompt = prompt.strip()
+        if not prompt:
+            return await reply(m, "Файл пустой.")
+    else:
+        prompt = m.text
+    await state.update_data(prompt=prompt, chosen=[], warned=False)
+    with db() as c:
+        catalog = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    if not catalog:
+        await state.set_state(NewPost.channel)
+        return await reply(m, 
+            "3/4. В каталоге нет каналов/ботов для подписки — эта публикация будет без подписки "
+            "(добавить их можно в меню «Каналы и боты»).\n\n"
+            "4/4. Куда публиковать? Пришлите <code>@username</code> канала, ID или перешлите сообщение из канала."
+        )
+    await state.set_state(NewPost.subs)
+    await reply(m, 
+        "3/4. На что нужно подписаться <b>для этой публикации</b>? Отметьте и нажмите «Далее» "
+        "(можно не выбирать ничего).",
+        reply_markup=picker_kb(catalog, set()),
+    )
+
+
+@router.callback_query(NewPost.subs, F.data.startswith("ps:t:"), ADMIN)
+async def np_toggle(cb: CallbackQuery, state: FSMContext):
+    sid = int(cb.data.split(":")[2])
+    data = await state.get_data()
+    chosen = set(data.get("chosen", []))
+    chosen.symmetric_difference_update({sid})
+    await state.update_data(chosen=list(chosen))
+    with db() as c:
+        catalog = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    await cb.message.edit_reply_markup(reply_markup=picker_kb(catalog, chosen))
+    await cb.answer()
+
+
+@router.callback_query(NewPost.subs, F.data == "ps:ok", ADMIN)
+async def np_subs_done(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("chosen") and not data.get("warned"):
+        await state.update_data(warned=True)
+        await cb.answer(
+            "Вы ничего не выбрали — подписка для этой публикации не потребуется. "
+            "Нажмите «Далее» ещё раз, если так и задумано.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(NewPost.channel)
+    await cb.message.edit_text(
+        "4/4. Куда публиковать? Пришлите <code>@username</code> канала или числовой ID, "
+        "либо перешлите любое сообщение из канала.\nБот должен быть админом канала с правом публикации."
+    )
+    await cb.answer()
+
+
+async def resolve_chat_ref(m: Message):
+    fo = getattr(m, "forward_origin", None)
+    if fo is not None and getattr(fo, "chat", None) is not None:
+        return fo.chat.id
+    if m.text:
+        t = m.text.strip()
+        if t.lstrip("-").isdigit():
+            return int(t)
+        if t.startswith("@"):
+            return t
+        if "t.me/" in t:
+            return "@" + t.rstrip("/").split("/")[-1]
+    return None
+
+
+@router.message(NewPost.channel, ADMIN)
+async def np_channel(m: Message, state: FSMContext, bot: Bot):
+    chat_ref = await resolve_chat_ref(m)
+    if chat_ref is None:
+        return await reply(m, "Не понял. Пришлите @username, ID или перешлите сообщение из канала.")
+    data = await state.get_data()
+
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO posts(text, photo, prompt, channel_id, created) VALUES(?,?,?,?,?)",
+            (data.get("text") or "", data.get("photo"), data["prompt"], str(chat_ref), int(time.time())),
+        )
+        post_id = cur.lastrowid
+        for sid in data.get("chosen", []):
+            c.execute("INSERT OR IGNORE INTO post_subs(post_id, sub_id) VALUES(?,?)", (post_id, sid))
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🎁 Получить промт", url=f"https://t.me/{BOT_USERNAME}?start=p{post_id}")
+        ]]
+    )
+    try:
+        if data.get("photo"):
+            sent = await bot.send_photo(chat_ref, data["photo"], caption=data.get("text") or None, reply_markup=kb)
+        else:
+            sent = await bot.send_message(chat_ref, data.get("text") or "🎁", reply_markup=kb)
+    except Exception as e:
+        with db() as c:
+            c.execute("DELETE FROM posts WHERE id=?", (post_id,))
+            c.execute("DELETE FROM post_subs WHERE post_id=?", (post_id,))
+        return await reply(m, f"❌ Не удалось опубликовать: {html.escape(str(e))}\nПроверьте, что бот — админ канала.")
+
+    with db() as c:
+        c.execute("UPDATE posts SET message_id=?, channel_id=? WHERE id=?", (sent.message_id, str(sent.chat.id), post_id))
+    await state.clear()
+    await wipe(bot, m.chat.id)
+    await reply(m, f"✅ Опубликовано (публикация #{post_id}).", reply_markup=admin_menu())
+
+
+# ---------- Каталог каналов и ботов ----------
+
+@router.callback_query(F.data == "adm:subs", ADMIN)
+async def cb_subs(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    with db() as c:
+        rows = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    kb = InlineKeyboardBuilder()
+    lines = ["📢 <b>Каналы и боты</b>\nЗдесь вы их добавляете, а при создании публикации выбираете, "
+             "что нужно именно для неё.\n"]
+    if not rows:
+        lines.append("Пока пусто.")
+    for r in rows:
+        icon = "📢" if r["kind"] == "channel" else "🤖"
+        note = ""
+        if r["kind"] == "bot":
+            note = " — запуск проверяется ✅" if r["token"] else " — без проверки (только «Готово»)"
+        lines.append(f"{icon} {html.escape(r['title'])}{note}")
+        row = [InlineKeyboardButton(text=f"🗑 {r['title'][:24]}", callback_data=f"subdel:{r['id']}")]
+        if r["kind"] == "bot" and not r["token"]:
+            row.append(InlineKeyboardButton(text="🔑 Токен", callback_data=f"subtoken:{r['id']}"))
+        kb.row(*row)
+    kb.row(
+        InlineKeyboardButton(text="➕ Канал", callback_data="subadd:channel"),
+        InlineKeyboardButton(text="➕ Бот", callback_data="subadd:bot"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ В меню", callback_data="adm:menu"))
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("subdel:"), ADMIN)
+async def cb_subdel(cb: CallbackQuery, state: FSMContext):
+    sid = int(cb.data.split(":")[1])
+    with db() as c:
+        c.execute("DELETE FROM subs WHERE id=?", (sid,))
+        c.execute("DELETE FROM post_subs WHERE sub_id=?", (sid,))
+    await cb.answer("Удалено")
+    await cb_subs(cb, state)
+
+
+@router.callback_query(F.data == "subadd:channel", ADMIN)
+async def cb_subadd_channel(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddChannel.wait)
+    await cb.message.edit_text(
+        "Пришлите <code>@username</code> канала, числовой ID или перешлите сообщение из канала.\n"
+        "⚠️ Бот должен быть <b>админом</b> этого канала — иначе он не сможет проверять подписку.\n/cancel — отмена"
+    )
+    await cb.answer()
+
+
+@router.message(AddChannel.wait, ADMIN)
+async def add_channel(m: Message, state: FSMContext, bot: Bot):
+    ref = await resolve_chat_ref(m)
+    if ref is None:
+        return await reply(m, "Не понял. Пришлите @username, ID или пересланное сообщение.")
+    try:
+        chat = await bot.get_chat(ref)
+        me = await bot.get_chat_member(chat.id, bot.id)
+        if me.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            return await reply(m, "Сделайте бота админом канала и пришлите канал ещё раз.")
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        else:
+            link = (await bot.create_chat_invite_link(chat.id)).invite_link
+    except Exception as e:
+        return await reply(m, f"❌ Не получилось: {html.escape(str(e))}")
+    with db() as c:
+        c.execute("INSERT INTO subs(kind, chat_id, title, link) VALUES('channel',?,?,?)", (chat.id, chat.title or str(chat.id), link))
+    await state.clear()
+    await wipe(bot, m.chat.id)
+    await reply(m, f"✅ Канал «{html.escape(chat.title or '')}» добавлен.", reply_markup=admin_menu())
+
+
+@router.callback_query(F.data == "subadd:bot", ADMIN)
+async def cb_subadd_bot(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddBot.wait)
+    await cb.message.edit_text(
+        "Пришлите <code>@username</code> бота или ссылку на него (можно с параметром, "
+        "например <code>https://t.me/mybot?start=abc</code>).\n/cancel — отмена"
+    )
+    await cb.answer()
+
+
+TOKEN_ASK = (
+    "🔑 Хотите проверять запуск этого бота по-настоящему?\n"
+    "Пришлите <b>токен этого бота</b> от @BotFather (вид <code>123456:ABC...</code>) — "
+    "и бот будет знать, запускал ли его человек. Сообщение с токеном я сразу удалю.\n\n"
+    "Подходит только для <b>ваших</b> ботов. Для чужих нажмите «Пропустить» — "
+    "тогда подтверждением служит кнопка «✅ Готово»."
+)
+
+
+def skip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏭ Пропустить", callback_data="bottoken:skip")]]
+    )
+
+
+async def say(bot: Bot, chat_id: int, text: str, **kw) -> None:
+    """Сообщение, которое потом уберёт wipe()."""
+    sent = await bot.send_message(chat_id, text, **kw)
+    _trash.setdefault(chat_id, []).append(sent.message_id)
+
+
+@router.message(AddBot.wait, ADMIN, F.text)
+async def add_bot(m: Message, state: FSMContext):
+    t = m.text.strip()
+    if t.startswith("@"):
+        username, link = t[1:], f"https://t.me/{t[1:]}"
+    elif "t.me/" in t:
+        link = t if t.startswith("http") else "https://" + t
+        username = t.split("t.me/")[1].split("?")[0].strip("/")
+    else:
+        return await reply(m, "Пришлите @username или ссылку вида https://t.me/mybot")
+    await state.update_data(username=username, link=link, sub_id=None)
+    await state.set_state(AddBot.token)
+    await reply(m, TOKEN_ASK, reply_markup=skip_kb())
+
+
+async def finish_bot(bot: Bot, chat_id: int, state: FSMContext, token: str | None) -> None:
+    data = await state.get_data()
+    with db() as c:
+        if data.get("sub_id"):
+            c.execute("UPDATE subs SET token=? WHERE id=?", (token, data["sub_id"]))
+            text = "✅ Токен сохранён — запуск бота теперь проверяется."
+        else:
+            c.execute(
+                "INSERT INTO subs(kind, chat_id, title, link, token) VALUES('bot',NULL,?,?,?)",
+                (f"@{data['username']}", data["link"], token),
+            )
+            text = f"✅ Бот @{html.escape(data['username'])} добавлен" + (
+                " (запуск проверяется)." if token else " (без проверки запуска).")
+    await state.clear()
+    await wipe(bot, chat_id)
+    await say(bot, chat_id, text, reply_markup=admin_menu())
+
+
+@router.message(AddBot.token, ADMIN, F.text)
+async def add_bot_token(m: Message, state: FSMContext, bot: Bot):
+    token = m.text.strip()
+    data = await state.get_data()
+    try:
+        tmp = Bot(token)
+        try:
+            me = await tmp.get_me()
+        finally:
+            await tmp.session.close()
+    except Exception:
+        return await reply(m, "❌ Токен не подошёл. Проверьте его в @BotFather и пришлите ещё раз "
+                              "или нажмите «Пропустить».", reply_markup=skip_kb())
+    expected = data.get("username")
+    if expected is None and data.get("sub_id"):
+        with db() as c:
+            row = c.execute("SELECT title FROM subs WHERE id=?", (data["sub_id"],)).fetchone()
+        expected = (row["title"] if row else "").lstrip("@")
+    if expected and (me.username or "").lower() != expected.lower():
+        return await reply(m, f"❌ Этот токен от бота @{html.escape(me.username or '?')}, а нужен @{html.escape(expected)}. "
+                              "Пришлите правильный токен или нажмите «Пропустить».", reply_markup=skip_kb())
+    await finish_bot(bot, m.chat.id, state, token)
+
+
+@router.callback_query(AddBot.token, F.data == "bottoken:skip", ADMIN)
+async def cb_bot_skip(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await cb.answer()
+    if data.get("sub_id"):  # добавление токена к существующему боту — просто отмена
+        await state.clear()
+        await wipe(bot, cb.message.chat.id)
+        await say(bot, cb.message.chat.id, "Отменено.", reply_markup=admin_menu())
+        return
+    await finish_bot(bot, cb.message.chat.id, state, None)
+
+
+@router.callback_query(F.data.startswith("subtoken:"), ADMIN)
+async def cb_subtoken(cb: CallbackQuery, state: FSMContext):
+    sid = int(cb.data.split(":")[1])
+    await state.update_data(sub_id=sid, username=None, link=None)
+    await state.set_state(AddBot.token)
+    await cb.message.edit_text(TOKEN_ASK, reply_markup=skip_kb())
+    await cb.answer()
+
+
+# ───────────────────────────── Запуск ─────────────────────────────
+
+async def main():
+    global BOT_USERNAME
+    if not BOT_TOKEN:
+        raise SystemExit("Не задан BOT_TOKEN")
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS пуст — админ-панель будет недоступна")
+    await gh_restore()
+    init_db()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    BOT_USERNAME = (await bot.get_me()).username
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    log.info("Бот @%s запущен", BOT_USERNAME)
+    task = None
+    if GH_ENABLED:
+        log.info("GitHub-бэкап включён: %s", GITHUB_REPO)
+        task = asyncio.create_task(backup_loop())
+    else:
+        log.warning("GitHub-бэкап выключен — данные хранятся только в %s", DB_PATH)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if task:
+            task.cancel()
+            await gh_backup()  # финальное сохранение при остановке
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
