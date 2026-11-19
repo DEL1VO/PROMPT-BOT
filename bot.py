@@ -9,6 +9,8 @@ Telegram-бот «Получить промт» (aiogram 3.x)
   Если промт длиннее PROMPT_FILE_THRESHOLD символов — присылает его текстовым файлом .txt.
 
 Переменные окружения: BOT_TOKEN, ADMIN_IDS, DB_PATH (см. README.md)
+FEATURES_LOCKED=1 (по умолчанию) — кнопки «Создать свой промт», «Купить генерации», «Мой баланс»
+показывают 🔒 и сообщение «функция в разработке». FEATURES_LOCKED=0 — снять замок.
 """
 
 import asyncio
@@ -42,6 +44,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -59,6 +62,11 @@ DATA_DIR = os.getenv("DATA_DIR", "")  # постоянная папка хост
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(DATA_DIR, "bot.db") if DATA_DIR else "bot.db")
 # промт длиннее этого числа символов отправляется текстовым файлом (.txt), а не сообщением
 FILE_THRESHOLD = int(os.getenv("PROMPT_FILE_THRESHOLD", "1500"))
+
+# ── Замок на функциях (1 — закрыто, 0 — открыто) ──
+FEATURES_LOCKED = os.getenv("FEATURES_LOCKED", "1") == "1"
+LOCK_TEXT = ("🔒 Эта функция в разработке.\n"
+             "Когда она станет доступна, мы сообщим вам. Спасибо за пользование ☺️")
 
 # ── Генерации: OpenAI, оплата, рефералы ──
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -92,6 +100,24 @@ GH_ENABLED = bool(GITHUB_TOKEN and GITHUB_REPO)
 _last_backup_hash = ""
 
 BOT_USERNAME = ""  # заполняется при старте
+
+# ── Реклама бота-скачивателя и подпись автора ──
+SAVER_URL = os.getenv("SAVER_URL", "https://t.me/Taj_Saverbot")
+OWNER_URL = os.getenv("OWNER_URL", "https://t.me/IDIEVW")
+OWNER_TAG = os.getenv("OWNER_TAG", "@IDIEVW")
+# картинка для рекламы: файл рядом с bot.py (по умолчанию saver_promo.jpg), либо file_id/ссылка в SAVER_PROMO_PHOTO
+SAVER_PROMO_PHOTO = os.getenv("SAVER_PROMO_PHOTO", "") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "saver_promo.jpg")
+SIGN = f'<a href="{OWNER_URL}">{html.escape(OWNER_TAG)}</a>'  # подпись внизу каждого промта (кликабельная)
+SAVER_TEXT = (
+    "🎬 <b>Скачивайте видео из Instagram и YouTube</b>\n\n"
+    "Наш бот скачает видео по ссылке и умеет превращать видео в музыку 🎵\n"
+    "Быстро, без водяных знаков и бесплатно."
+)
+TIP_SINGLE = ("💡 <b>Совет:</b> загружай одновременно 2 фотографии: свою фото, а также это фото как референс. "
+              "Так генератору будет проще сохранить ваше лицо и повторить позу.")
+TIP_PAIR = ("💡 <b>Совет:</b> загружай одновременно 2 фотографии: свою и девушки, а также это фото как референс. "
+            "Так генератору будет проще сохранить ваши лица и повторить позу.")
+_saver_photo_id = ""  # file_id после первой отправки — дальше фото не загружается заново
 
 router = Router()
 ADMIN = F.from_user.id.in_(ADMIN_IDS)
@@ -180,6 +206,9 @@ def init_db() -> None:
         ):
             if name not in ucols:
                 c.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+        pcols = [r[1] for r in c.execute("PRAGMA table_info(posts)")]
+        if "kind" not in pcols:  # 'single' — одиночка, 'pair' — пара
+            c.execute("ALTER TABLE posts ADD COLUMN kind TEXT DEFAULT 'single'")
         cols = [r[1] for r in c.execute("PRAGMA table_info(subs)")]
         if "token" not in cols:  # токен бота для настоящей проверки запуска (необязателен)
             c.execute("ALTER TABLE subs ADD COLUMN token TEXT")
@@ -339,6 +368,7 @@ async def backup_loop() -> None:
 class NewPost(StatesGroup):
     content = State()
     prompt = State()
+    kind = State()
     subs = State()
     channel = State()
 
@@ -539,19 +569,58 @@ async def bot_status(bot: Bot, sub: sqlite3.Row, user_id: int):
 
 
 async def send_prompt(bot: Bot, user_id: int, post_id: int, prompt: str) -> None:
-    """Короткий промт — текстом в <code>-блоке, длинный — текстовым файлом."""
+    """Короткий промт — текстом в <code>-блоке, длинный — текстовым файлом. Внизу всегда подпись автора."""
     if len(prompt) > FILE_THRESHOLD:
         # utf-8-sig: BOM помогает Блокноту/Windows правильно открыть кириллицу
         data = prompt.encode("utf-8-sig")
         await bot.send_document(
             user_id,
             BufferedInputFile(data, filename=f"prompt_{post_id}.txt"),
-            caption="Ваш промт 💛\nОн длинный, поэтому прислан файлом — откройте и скопируйте текст.",
+            caption=f"Ваш промт 💛\nОн длинный, поэтому прислан файлом — откройте и скопируйте текст.\n\n{SIGN}",
         )
         return
     await bot.send_message(user_id, "Ваш промт 💛")
-    for chunk in split_text(prompt):
-        await bot.send_message(user_id, f"<code>{html.escape(chunk)}</code>")
+    chunks = split_text(prompt)
+    for i, chunk in enumerate(chunks):
+        tail = f"\n\n{SIGN}" if i == len(chunks) - 1 else ""  # подпись под последней частью
+        await bot.send_message(user_id, f"<code>{html.escape(chunk)}</code>{tail}", disable_web_page_preview=True)
+
+
+async def send_tip(bot: Bot, user_id: int, post) -> None:
+    """Совет под промтом: с фото публикации из канала (одиночка / пара)."""
+    text = TIP_PAIR if post["kind"] == "pair" else TIP_SINGLE
+    try:
+        if post["photo"]:
+            await bot.send_photo(user_id, post["photo"], caption=text)
+        else:
+            await bot.send_message(user_id, text)
+    except Exception as e:
+        log.warning("не удалось отправить совет: %s", e)
+        try:
+            await bot.send_message(user_id, text)
+        except Exception:
+            pass
+
+
+async def send_saver_promo(bot: Bot, user_id: int) -> None:
+    """Реклама бота-скачивателя: картинка + кнопка «Открыть» (если картинки нет — просто текст с кнопкой)."""
+    global _saver_photo_id
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть", url=SAVER_URL)]])
+    photo = _saver_photo_id or SAVER_PROMO_PHOTO
+    try:
+        if photo and (_saver_photo_id or photo.startswith(("http", "AgAC")) or os.path.exists(photo)):
+            src = photo if (_saver_photo_id or photo.startswith(("http", "AgAC"))) else FSInputFile(photo)
+            sent = await bot.send_photo(user_id, src, caption=SAVER_TEXT, reply_markup=kb)
+            if sent.photo:
+                _saver_photo_id = sent.photo[-1].file_id
+            return
+    except Exception as e:
+        log.warning("не удалось отправить картинку рекламы: %s", e)
+        _saver_photo_id = ""
+    try:
+        await bot.send_message(user_id, SAVER_TEXT, reply_markup=kb)
+    except Exception:
+        pass
 
 
 async def check_bots(bot: Bot, user_id: int, post_id: int):
@@ -606,6 +675,8 @@ async def process(bot: Bot, user_id: int, post_id: int, bots_confirmed: bool = F
     with db() as c:
         c.execute("INSERT INTO claims(user_id, post_id, ts) VALUES(?,?,?)", (user_id, post_id, int(time.time())))
     await send_prompt(bot, user_id, post_id, post["prompt"])
+    await send_tip(bot, user_id, post)
+    await send_saver_promo(bot, user_id)
     ensure_user_row(user_id)
     await bot.send_message(user_id, promo_text(user_id), reply_markup=promo_kb())
     await ensure_reply_kb(bot, user_id)
@@ -885,11 +956,21 @@ async def register_referral(bot: Bot, new_id: int, ref_id: int) -> None:
         pass
 
 
-BTN_CREATE = "🎨 Создать свой промт"
+# Тексты кнопок. Пока FEATURES_LOCKED=1 — вместо иконки стоит 🔒.
+# Варианты и с замком, и без учитываются всегда, поэтому старые клавиатуры у пользователей тоже работают.
+BTN_CREATE = "🔒 Создать свой промт" if FEATURES_LOCKED else "🎨 Создать свой промт"
 BTN_SHARE = "📤 Поделиться"
-BTN_BUY = "💳 Купить генерации"
-BTN_BAL = "💎 Мой баланс"
-BUTTON_TEXTS = {BTN_CREATE, BTN_SHARE, BTN_BUY, BTN_BAL}
+BTN_BUY = "🔒 Купить генерации" if FEATURES_LOCKED else "💳 Купить генерации"
+BTN_BAL = "🔒 Мой баланс" if FEATURES_LOCKED else "💎 Мой баланс"
+CREATE_ALL = {"🎨 Создать свой промт", "🔒 Создать свой промт"}
+BUY_ALL = {"💳 Купить генерации", "🔒 Купить генерации"}
+BAL_ALL = {"💎 Мой баланс", "🔒 Мой баланс"}
+BUTTON_TEXTS = {BTN_SHARE} | CREATE_ALL | BUY_ALL | BAL_ALL
+
+
+def ico(normal: str) -> str:
+    """Иконка для inline-кнопок: 🔒 при включённом замке."""
+    return "🔒" if FEATURES_LOCKED else normal
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -934,7 +1015,7 @@ def promo_text(uid: int) -> str:
 
 def promo_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎨 Создать свой промт", callback_data="gen:new")
+    kb.button(text=f"{ico('🎨')} Создать свой промт", callback_data="gen:new")
     kb.button(text="📤 Поделиться с друзьями", callback_data="menu:share")
     kb.adjust(1)
     return kb.as_markup()
@@ -952,9 +1033,9 @@ def menu_text(uid: int) -> str:
 
 def user_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎨 Создать свой промт", callback_data="gen:new")
+    kb.button(text=f"{ico('🎨')} Создать свой промт", callback_data="gen:new")
     kb.button(text="📤 Поделиться", callback_data="menu:share")
-    kb.button(text="💳 Купить генерации", callback_data="buy:menu")
+    kb.button(text=f"{ico('💳')} Купить генерации", callback_data="buy:menu")
     kb.adjust(1, 2)
     return kb.as_markup()
 
@@ -1124,6 +1205,8 @@ async def begin_create(user, state: FSMContext):
 
 @router.callback_query(F.data == "gen:new")
 async def cb_gen_new(cb: CallbackQuery, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await cb.answer(LOCK_TEXT, show_alert=True)
     text, kb, alert = await begin_create(cb.from_user, state)
     if alert:
         return await cb.answer(alert, show_alert=True)
@@ -1133,8 +1216,10 @@ async def cb_gen_new(cb: CallbackQuery, state: FSMContext):
 
 # --- постоянные кнопки внизу чата (reply-клавиатура) ---
 
-@router.message(F.text == BTN_CREATE)
+@router.message(F.text.in_(CREATE_ALL))
 async def btn_create(m: Message, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await m.answer(LOCK_TEXT)
     text, kb, alert = await begin_create(m.from_user, state)
     await m.answer(alert or text, reply_markup=kb)
 
@@ -1147,15 +1232,19 @@ async def btn_share(m: Message, state: FSMContext):
     await m.answer(text, reply_markup=kb)
 
 
-@router.message(F.text == BTN_BUY)
+@router.message(F.text.in_(BUY_ALL))
 async def btn_buy(m: Message, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await m.answer(LOCK_TEXT)
     await state.clear()
     ensure_user(m.from_user)
     await m.answer(buy_text(), reply_markup=buy_kb())
 
 
-@router.message(F.text == BTN_BAL)
+@router.message(F.text.in_(BAL_ALL))
 async def btn_balance(m: Message, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await m.answer(LOCK_TEXT)
     await state.clear()
     ensure_user(m.from_user)
     await m.answer(menu_text(m.from_user.id), reply_markup=user_menu())
@@ -1199,7 +1288,7 @@ async def got_reference(m: Message, state: FSMContext, bot: Bot):
         BufferedInputFile(prompt.encode("utf-8-sig"), filename=f"prompt_{gid}.txt"),
         caption=(
             "✅ <b>Ваш промт готов</b> 💛\n\nОткройте файл, скопируйте текст и отправьте его в ChatGPT вместе "
-            f"со своим фото, где хорошо видно лицо.\n\nОсталось: 🎁 {free} · 💎 {paid}"
+            f"со своим фото, где хорошо видно лицо.\n\nОсталось: 🎁 {free} · 💎 {paid}\n\n{SIGN}"
         ),
         reply_markup=kb.as_markup(),
     )
@@ -1214,6 +1303,8 @@ async def ref_wrong(m: Message):
 
 @router.callback_query(F.data.startswith("genphoto:"))
 async def cb_genphoto(cb: CallbackQuery, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await cb.answer(LOCK_TEXT, show_alert=True)
     gid = int(cb.data.split(":")[1])
     with db() as c:
         g = c.execute("SELECT * FROM gens WHERE id=?", (gid,)).fetchone()
@@ -1299,6 +1390,8 @@ def pay_kb(pid: int) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "buy:menu")
 async def cb_buy_menu(cb: CallbackQuery, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await cb.answer(LOCK_TEXT, show_alert=True)
     await state.clear()
     ensure_user(cb.from_user)
     await edit_or_send(cb, buy_text(), buy_kb())
@@ -1307,6 +1400,8 @@ async def cb_buy_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.regexp(r"^buy:\d+$"))
 async def cb_buy(cb: CallbackQuery, state: FSMContext):
+    if FEATURES_LOCKED:
+        return await cb.answer(LOCK_TEXT, show_alert=True)
     qty = int(cb.data.split(":")[1])
     price = dict(PACKAGES).get(qty)
     if price is None:
@@ -1390,7 +1485,7 @@ async def _finish_payment(cb: CallbackQuery, bot: Bot, approve: bool) -> None:
         if approve:
             _, paid = balance(row["user_id"])
             kb = InlineKeyboardBuilder()
-            kb.button(text="🎨 Создать свой промт", callback_data="gen:new")
+            kb.button(text=f"{ico('🎨')} Создать свой промт", callback_data="gen:new")
             await bot.send_message(
                 row["user_id"],
                 f"✅ <b>Платёж подтверждён!</b>\nНачислено: <b>{row['qty']}</b> платных генераций 💎\nБаланс: {paid}",
@@ -1466,21 +1561,45 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "adm:stats", ADMIN)
 async def cb_stats(cb: CallbackQuery):
+    now = int(time.time())
     with db() as c:
         users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        posts = c.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        d1 = c.execute("SELECT COUNT(*) FROM users WHERE first_seen>=?", (now - 86400,)).fetchone()[0]
+        d7 = c.execute("SELECT COUNT(*) FROM users WHERE first_seen>=?", (now - 7 * 86400,)).fetchone()[0]
+        refs = c.execute("SELECT COUNT(*) FROM users WHERE ref_by IS NOT NULL").fetchone()[0]
+        posts = c.execute("SELECT COUNT(*), COALESCE(SUM(kind='pair'),0) FROM posts").fetchone()
         claims = c.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
         uniq = c.execute("SELECT COUNT(DISTINCT user_id) FROM claims").fetchone()[0]
         gens = c.execute("SELECT COUNT(*), COALESCE(SUM(photo_used),0) FROM gens").fetchone()
         pays = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments WHERE status='ok'").fetchone()
         pend = c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👥 Список пользователей (файл)", callback_data="adm:users")
+    kb.button(text="⬅️ В меню", callback_data="adm:menu")
+    kb.adjust(1)
     await cb.message.edit_text(
-        f"📊 <b>Статистика</b>\n\nПользователей: {users}\nПубликаций: {posts}\n"
+        f"📊 <b>Статистика</b>\n\n👥 <b>Пользователей бота: {users}</b>\n"
+        f"Новых за 24 часа: {d1}, за 7 дней: {d7}\nПришли по приглашению друзей: {refs}\n\n"
+        f"Публикаций: {posts[0]} (одиночка: {posts[0] - posts[1]}, пара: {posts[1]})\n"
         f"Выдач промта: {claims} (уникальных людей: {uniq})\n\n"
         f"🎨 Создано промтов: {gens[0]}, фото сгенерировано: {gens[1]}\n"
         f"💳 Платежей подтверждено: {pays[0]} на {fmt_price(pays[1])} сомони, ждут решения: {pend}",
-        reply_markup=back_menu(),
+        reply_markup=kb.as_markup(),
     )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:users", ADMIN)
+async def cb_users(cb: CallbackQuery, bot: Bot):
+    with db() as c:
+        rows = c.execute("SELECT user_id, username, first_seen FROM users ORDER BY first_seen DESC").fetchall()
+    lines = [f"Всего: {len(rows)}", "id | username | дата"]
+    for r in rows:
+        who = f"@{r['username']}" if r["username"] else "-"
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["first_seen"] or 0))
+        lines.append(f"{r['user_id']} | {who} | {when} UTC")
+    await bot.send_document(cb.from_user.id, BufferedInputFile("\n".join(lines).encode("utf-8-sig"), filename="users.txt"),
+                            caption=f"👥 Пользователей: {len(rows)}")
     await cb.answer()
 
 
@@ -1574,7 +1693,7 @@ async def cb_postdel(cb: CallbackQuery, bot: Bot):
 async def cb_newpost(cb: CallbackQuery, state: FSMContext):
     await state.set_state(NewPost.content)
     await cb.message.edit_text(
-        "1/4. Пришлите <b>текст публикации</b> для канала (можно с фото и форматированием).\n"
+        "1/5. Пришлите <b>текст публикации</b> для канала (можно с фото и форматированием).\n"
         "Отмена: /cancel"
     )
     await cb.answer()
@@ -1589,8 +1708,8 @@ async def np_content(m: Message, state: FSMContext):
     else:
         return await reply(m, "Нужен текст или фото с подписью.")
     await state.set_state(NewPost.prompt)
-    await reply(m, 
-        "2/4. Пришлите <b>промт для этой публикации</b> обычным текстом (без фото) "
+    await reply(m,
+        "2/5. Пришлите <b>промт для этой публикации</b> обычным текстом (без фото) "
         "или файлом <code>.txt</code>, если он очень длинный. "
         "Его не будет в канале — пользователь получит его в боте после нажатия кнопки "
         "(длинный промт придёт текстовым файлом)."
@@ -1628,20 +1747,34 @@ async def np_prompt(m: Message, state: FSMContext, bot: Bot):
     else:
         prompt = m.text
     await state.update_data(prompt=prompt, chosen=[], warned=False)
+    await state.set_state(NewPost.kind)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧍 Одиночка", callback_data="pk:single")
+    kb.button(text="👫 Пара", callback_data="pk:pair")
+    kb.adjust(2)
+    await reply(m, "3/5. Это фото <b>одиночное</b> или <b>парное</b>? От этого зависит совет, "
+                   "который получит пользователь после промта.", reply_markup=kb.as_markup())
+
+
+@router.callback_query(NewPost.kind, F.data.startswith("pk:"), ADMIN)
+async def np_kind(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(kind=cb.data.split(":")[1])
     with db() as c:
         catalog = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    await cb.answer()
+    m = cb.message
     if not catalog:
         await state.set_state(NewPost.channel)
-        return await reply(m, 
-            "3/4. В каталоге нет каналов/ботов для подписки — эта публикация будет без подписки "
+        return await edit_or_send(cb,
+            "4/5. В каталоге нет каналов/ботов для подписки — эта публикация будет без подписки "
             "(добавить их можно в меню «Каналы и боты»).\n\n"
-            "4/4. Куда публиковать? Пришлите <code>@username</code> канала, ID или перешлите сообщение из канала."
+            "5/5. Куда публиковать? Пришлите <code>@username</code> канала, ID или перешлите сообщение из канала."
         )
     await state.set_state(NewPost.subs)
-    await reply(m, 
-        "3/4. На что нужно подписаться <b>для этой публикации</b>? Отметьте и нажмите «Далее» "
+    await edit_or_send(cb,
+        "4/5. На что нужно подписаться <b>для этой публикации</b>? Отметьте и нажмите «Далее» "
         "(можно не выбирать ничего).",
-        reply_markup=picker_kb(catalog, set()),
+        picker_kb(catalog, set()),
     )
 
 
@@ -1671,7 +1804,7 @@ async def np_subs_done(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(NewPost.channel)
     await cb.message.edit_text(
-        "4/4. Куда публиковать? Пришлите <code>@username</code> канала или числовой ID, "
+        "5/5. Куда публиковать? Пришлите <code>@username</code> канала или числовой ID, "
         "либо перешлите любое сообщение из канала.\nБот должен быть админом канала с правом публикации."
     )
     await cb.answer()
@@ -1701,8 +1834,9 @@ async def np_channel(m: Message, state: FSMContext, bot: Bot):
 
     with db() as c:
         cur = c.execute(
-            "INSERT INTO posts(text, photo, prompt, channel_id, created) VALUES(?,?,?,?,?)",
-            (data.get("text") or "", data.get("photo"), data["prompt"], str(chat_ref), int(time.time())),
+            "INSERT INTO posts(text, photo, prompt, channel_id, created, kind) VALUES(?,?,?,?,?,?)",
+            (data.get("text") or "", data.get("photo"), data["prompt"], str(chat_ref), int(time.time()),
+             data.get("kind") or "single"),
         )
         post_id = cur.lastrowid
         for sid in data.get("chosen", []):
