@@ -55,6 +55,10 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     WebAppInfo,
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    MenuButtonCommands,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -739,7 +743,8 @@ async def process(bot: Bot, user_id: int, post_id: int, bots_confirmed: bool = F
         await send_tip(bot, user_id, post)
         await send_saver_promo(bot, user_id)
     ensure_user_row(user_id)
-    await bot.send_message(user_id, promo_text(user_id), reply_markup=promo_kb())
+    if not FEATURES_LOCKED:  # пока функция «Создать свой промт» закрыта — это сообщение не отправляем
+        await bot.send_message(user_id, promo_text(user_id), reply_markup=promo_kb())
     await ensure_reply_kb(bot, user_id)
 
 
@@ -2271,6 +2276,28 @@ def make_web_app(bot: Bot):
     return app
 
 
+async def setup_commands(bot: Bot) -> None:
+    """Команды в кнопке «Меню» рядом с полем ввода: у всех — общие, у админов — расширенный список."""
+    users = [BotCommand(command="start", description="Запустить бота"),
+             BotCommand(command="menu", description="Главное меню")]
+    admins = users + [BotCommand(command="admin", description="Админ-панель"),
+                      BotCommand(command="setpromo", description="Фото рекламы бота"),
+                      BotCommand(command="backup", description="Бэкап базы в GitHub"),
+                      BotCommand(command="aicheck", description="Проверка ключей генерации"),
+                      BotCommand(command="give", description="Выдать генерации: /give ID КОЛ-ВО"),
+                      BotCommand(command="cancel", description="Отмена")]
+    try:
+        await bot.set_my_commands(users, scope=BotCommandScopeDefault())
+        for aid in ADMIN_IDS:
+            try:
+                await bot.set_my_commands(admins, scope=BotCommandScopeChat(chat_id=aid))
+            except Exception as e:
+                log.warning("команды для админа %s: %s", aid, e)
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        log.warning("не удалось установить команды меню: %s", e)
+
+
 async def main():
     global BOT_USERNAME
     if not BOT_TOKEN:
@@ -2283,6 +2310,7 @@ async def main():
     BOT_USERNAME = (await bot.get_me()).username
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    await setup_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Бот @%s запущен", BOT_USERNAME)
     runner = None
