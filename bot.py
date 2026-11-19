@@ -8,7 +8,10 @@ Telegram-бот «Получить промт» (aiogram 3.x)
   и присылает «Ваш промт 💛» + промт текстом (без фото) в <code>-блоке: нажатие копирует.
   Если промт длиннее PROMPT_FILE_THRESHOLD символов — присылает его текстовым файлом .txt.
 
-Переменные окружения: BOT_TOKEN, ADMIN_IDS, DB_PATH (см. README.md)
+Мини-приложение (webapp.html): если задан WEBAPP_URL (публичный https-адрес бота), промт выдаётся не в чат,
+а в Telegram Mini App — бот сам отдаёт webapp.html и API (aiohttp, порт PORT).
+
+Переменные окружения: BOT_TOKEN, ADMIN_IDS, DB_PATH, WEBAPP_URL, PORT (см. README.md)
 FEATURES_LOCKED=1 (по умолчанию) — кнопки «Создать свой промт», «Купить генерации», «Мой баланс»
 показывают 🔒 и сообщение «функция в разработке». FEATURES_LOCKED=0 — снять замок.
 """
@@ -16,6 +19,7 @@ FEATURES_LOCKED=1 (по умолчанию) — кнопки «Создать с
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import json
 import math
@@ -24,7 +28,7 @@ import os
 import sqlite3
 import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 
 try:
     from dotenv import load_dotenv
@@ -50,6 +54,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -107,6 +112,10 @@ OWNER_URL = os.getenv("OWNER_URL", "https://t.me/IDIEVW")
 OWNER_TAG = os.getenv("OWNER_TAG", "@IDIEVW")
 # картинка для рекламы: файл рядом с bot.py (по умолчанию saver_promo.jpg), либо file_id/ссылка в SAVER_PROMO_PHOTO
 SAVER_PROMO_PHOTO = os.getenv("SAVER_PROMO_PHOTO", "") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "saver_promo.jpg")
+# ── Мини-приложение «PROMPT TAJ» ──
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")  # например https://mybot.bothost.ru ; пусто — мини-апп выключен
+PORT = int(os.getenv("PORT", "8080"))
+WEBAPP_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp.html")
 SIGN = f'<a href="{OWNER_URL}">{html.escape(OWNER_TAG)}</a>'  # подпись внизу каждого промта (кликабельная)
 SAVER_TEXT = (
     "🎬 <b>Скачивайте видео из Instagram и YouTube</b>\n\n"
@@ -188,6 +197,10 @@ def init_db() -> None:
                 status TEXT DEFAULT 'pending',
                 created INTEGER
             );
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
             CREATE TABLE IF NOT EXISTS claims(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -203,6 +216,8 @@ def init_db() -> None:
             ("paid_gens", "INTEGER DEFAULT 0"),
             ("ref_bonus", "INTEGER DEFAULT 0"),
             ("kb_shown", "INTEGER DEFAULT 0"),  # показывали ли постоянные кнопки внизу
+            ("first_name", "TEXT"),
+            ("webapp_at", "INTEGER"),  # когда впервые открыл мини-приложение
         ):
             if name not in ucols:
                 c.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
@@ -382,6 +397,10 @@ class Pay(StatesGroup):
     receipt = State()  # ждём чек
 
 
+class SetPromo(StatesGroup):
+    wait = State()  # ждём фото (или пересланный пост канала) для рекламы
+
+
 class AddChannel(StatesGroup):
     wait = State()
 
@@ -399,6 +418,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     kb.button(text="📋 Публикации", callback_data="adm:posts")
     kb.button(text="📢 Каналы и боты для подписки", callback_data="adm:subs")
     kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.button(text="🖼 Фото рекламы бота", callback_data="adm:setpromo")
     kb.button(text="👤 Меню пользователя", callback_data="menu:home")
     kb.adjust(1)
     return kb.as_markup()
@@ -457,7 +477,7 @@ async def is_member(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 # служебные сообщения бота, которые нужно убрать при следующем действии: chat_id -> [message_id]
 _trash: dict[int, list[int]] = {}
-CLEAN_CMDS = {"/start", "/admin", "/cancel", "/backup", "/menu", "/give", "/aicheck"}
+CLEAN_CMDS = {"/setpromo", "/start", "/admin", "/cancel", "/backup", "/menu", "/give", "/aicheck"}
 
 
 async def reply(m: Message, text: str, **kw) -> Message:
@@ -602,14 +622,52 @@ async def send_tip(bot: Bot, user_id: int, post) -> None:
             pass
 
 
+async def announce_ready(bot: Bot, user_id: int, post_id: int) -> None:
+    """Анимация загрузки в процентах, затем «Ваш промт готов» с кнопкой «Открыть» (мини-приложение)."""
+    title = "⏳ Готовим ваш промт…"
+    msg = await bot.send_message(user_id, f"{title}\n\n{bar(0)} 0%")
+    _trash.setdefault(user_id, []).append(msg.message_id)
+    for p in (14, 31, 47, 63, 78, 91, 100):
+        await asyncio.sleep(0.5)
+        try:
+            await bot.edit_message_text(f"{title}\n\n{bar(p)} {p}%", chat_id=user_id, message_id=msg.message_id)
+        except Exception:
+            pass
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Открыть", web_app=WebAppInfo(url=f"{WEBAPP_URL}/app?p={post_id}"))
+    ]])
+    try:
+        await bot.edit_message_text(
+            "✅ <b>Ваш промт готов!</b>\n\nНажмите на кнопку «Открыть», чтобы получить его.",
+            chat_id=user_id, message_id=msg.message_id, reply_markup=kb,
+        )
+    except Exception:
+        sent = await bot.send_message(user_id, "✅ <b>Ваш промт готов!</b>\n\nНажмите на кнопку «Открыть», чтобы получить его.",
+                                      reply_markup=kb)
+        _trash.setdefault(user_id, []).append(sent.message_id)
+
+
+def get_setting(key: str) -> str:
+    with db() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else ""
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO settings(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, value))
+
+
 async def send_saver_promo(bot: Bot, user_id: int) -> None:
     """Реклама бота-скачивателя: картинка + кнопка «Открыть» (если картинки нет — просто текст с кнопкой)."""
     global _saver_photo_id
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть", url=SAVER_URL)]])
-    photo = _saver_photo_id or SAVER_PROMO_PHOTO
+    # приоритет: фото, выбранное админом из канала (/setpromo) → SAVER_PROMO_PHOTO → файл saver_promo.jpg
+    photo = _saver_photo_id or get_setting("promo_photo") or SAVER_PROMO_PHOTO
     try:
         if photo and (_saver_photo_id or photo.startswith(("http", "AgAC")) or os.path.exists(photo)):
-            src = photo if (_saver_photo_id or photo.startswith(("http", "AgAC"))) else FSInputFile(photo)
+            src = photo if (_saver_photo_id or get_setting("promo_photo") == photo or photo.startswith(("http", "AgAC"))) else FSInputFile(photo)
             sent = await bot.send_photo(user_id, src, caption=SAVER_TEXT, reply_markup=kb)
             if sent.photo:
                 _saver_photo_id = sent.photo[-1].file_id
@@ -674,9 +732,12 @@ async def process(bot: Bot, user_id: int, post_id: int, bots_confirmed: bool = F
 
     with db() as c:
         c.execute("INSERT INTO claims(user_id, post_id, ts) VALUES(?,?,?)", (user_id, post_id, int(time.time())))
-    await send_prompt(bot, user_id, post_id, post["prompt"])
-    await send_tip(bot, user_id, post)
-    await send_saver_promo(bot, user_id)
+    if WEBAPP_URL:
+        await announce_ready(bot, user_id, post_id)  # промт откроется в мини-приложении
+    else:
+        await send_prompt(bot, user_id, post_id, post["prompt"])
+        await send_tip(bot, user_id, post)
+        await send_saver_promo(bot, user_id)
     ensure_user_row(user_id)
     await bot.send_message(user_id, promo_text(user_id), reply_markup=promo_kb())
     await ensure_reply_kb(bot, user_id)
@@ -1559,6 +1620,40 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+ASK_PROMO = ("🖼 Перешлите сюда <b>пост из вашего канала с фото</b> (или просто отправьте фото) — "
+             "оно станет картинкой рекламы Taj_Saverbot.\nОтмена: /cancel")
+
+
+@router.callback_query(F.data == "adm:setpromo", ADMIN)
+async def cb_setpromo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SetPromo.wait)
+    await cb.message.edit_text(ASK_PROMO)
+    await cb.answer()
+
+
+@router.message(Command("setpromo"), ADMIN)
+async def cmd_setpromo(m: Message, state: FSMContext):
+    await state.set_state(SetPromo.wait)
+    await reply(m, ASK_PROMO)
+
+
+@router.message(SetPromo.wait, ADMIN, F.photo)
+async def got_promo_photo(m: Message, state: FSMContext, bot: Bot):
+    global _saver_photo_id
+    set_setting("promo_photo", m.photo[-1].file_id)
+    _saver_photo_id = ""
+    await state.clear()
+    await wipe(bot, m.chat.id)
+    await reply(m, "✅ Фото рекламы сохранено. Вот как его увидят пользователи:")
+    await send_saver_promo(bot, m.from_user.id)
+    await reply(m, "Меню:", reply_markup=admin_menu())
+
+
+@router.message(SetPromo.wait, ADMIN, ~F.text.startswith("/"))
+async def promo_wrong(m: Message):
+    await reply(m, "Нужен пост с фото или просто фото. Отмена: /cancel")
+
+
 @router.callback_query(F.data == "adm:stats", ADMIN)
 async def cb_stats(cb: CallbackQuery):
     now = int(time.time())
@@ -1567,6 +1662,7 @@ async def cb_stats(cb: CallbackQuery):
         d1 = c.execute("SELECT COUNT(*) FROM users WHERE first_seen>=?", (now - 86400,)).fetchone()[0]
         d7 = c.execute("SELECT COUNT(*) FROM users WHERE first_seen>=?", (now - 7 * 86400,)).fetchone()[0]
         refs = c.execute("SELECT COUNT(*) FROM users WHERE ref_by IS NOT NULL").fetchone()[0]
+        webapp = c.execute("SELECT COUNT(*) FROM users WHERE webapp_at IS NOT NULL").fetchone()[0]
         posts = c.execute("SELECT COUNT(*), COALESCE(SUM(kind='pair'),0) FROM posts").fetchone()
         claims = c.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
         uniq = c.execute("SELECT COUNT(DISTINCT user_id) FROM claims").fetchone()[0]
@@ -1579,7 +1675,8 @@ async def cb_stats(cb: CallbackQuery):
     kb.adjust(1)
     await cb.message.edit_text(
         f"📊 <b>Статистика</b>\n\n👥 <b>Пользователей бота: {users}</b>\n"
-        f"Новых за 24 часа: {d1}, за 7 дней: {d7}\nПришли по приглашению друзей: {refs}\n\n"
+        f"Новых за 24 часа: {d1}, за 7 дней: {d7}\nПришли по приглашению друзей: {refs}\n"
+        f"Открывали мини-приложение: {webapp}\n\n"
         f"Публикаций: {posts[0]} (одиночка: {posts[0] - posts[1]}, пара: {posts[1]})\n"
         f"Выдач промта: {claims} (уникальных людей: {uniq})\n\n"
         f"🎨 Создано промтов: {gens[0]}, фото сгенерировано: {gens[1]}\n"
@@ -2050,6 +2147,130 @@ async def cb_subtoken(cb: CallbackQuery, state: FSMContext):
 
 # ───────────────────────────── Запуск ─────────────────────────────
 
+# ───────────────────────────── Мини-приложение: сервер и API ─────────────────────────────
+
+def check_init_data(init_data: str):
+    """Проверка подписи Telegram (initData). Возвращает dict пользователя или None."""
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        if not got or not BOT_TOKEN:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        return user if user.get("id") else None
+    except Exception:
+        return None
+
+
+def webapp_register(u: dict) -> None:
+    """Регистрирует пользователя мини-приложения и привязывает к профилю (id, username, имя)."""
+    now = int(time.time())
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO users(user_id, username, first_seen) VALUES(?,?,?)",
+                  (u["id"], u.get("username"), now))
+        c.execute("UPDATE users SET username=COALESCE(?, username), first_name=?, "
+                  "webapp_at=COALESCE(webapp_at, ?) WHERE user_id=?",
+                  (u.get("username"), u.get("first_name"), now, u["id"]))
+
+
+_photo_cache: dict[str, bytes] = {}
+_dl_last: dict[int, float] = {}
+
+
+async def _wa_context(request):
+    """Общая проверка запроса мини-приложения: (user, post, ошибка-ответ)."""
+    from aiohttp import web
+
+    try:
+        body = await request.json()
+    except Exception:
+        return None, None, web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    user = check_init_data(str(body.get("initData", "")))
+    if not user:
+        return None, None, web.json_response({"ok": False, "error": "bad_init"}, status=401)
+    webapp_register(user)
+    try:
+        post_id = int(body.get("post", 0))
+    except (TypeError, ValueError):
+        post_id = 0
+    with db() as c:
+        post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+        if not post:
+            return None, None, web.json_response({"ok": False, "error": "no_post"}, status=404)
+        # промт отдаём только тем, кто прошёл проверку подписок (запись в claims появляется после неё)
+        if not c.execute("SELECT 1 FROM claims WHERE user_id=? AND post_id=?", (user["id"], post_id)).fetchone():
+            return None, None, web.json_response({"ok": False, "error": "no_claim"}, status=403)
+    return user, post, None
+
+
+def make_web_app(bot: Bot):
+    from aiohttp import web
+
+    async def page(request):
+        try:
+            with open(WEBAPP_HTML, encoding="utf-8") as f:
+                return web.Response(text=f.read(), content_type="text/html", headers={"Cache-Control": "no-store"})
+        except OSError:
+            return web.Response(text="webapp.html не найден рядом с bot.py", status=500)
+
+    async def api_open(request):
+        user, post, err = await _wa_context(request)
+        if err:
+            return err
+        return web.json_response({"ok": True, "kind": post["kind"] or "single", "prompt": post["prompt"],
+                                  "has_photo": bool(post["photo"])})
+
+    async def api_photo(request):
+        user, post, err = await _wa_context(request)
+        if err:
+            return err
+        fid = post["photo"]
+        if not fid:
+            return web.Response(status=404)
+        if fid not in _photo_cache:
+            buf = await bot.download(fid)
+            if len(_photo_cache) > 40:
+                _photo_cache.clear()
+            _photo_cache[fid] = buf.getvalue()
+        return web.Response(body=_photo_cache[fid], content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+    async def api_download(request):
+        user, post, err = await _wa_context(request)
+        if err:
+            return err
+        uid = user["id"]
+        if time.time() - _dl_last.get(uid, 0) < 4:
+            return web.json_response({"ok": True})  # защита от двойного нажатия
+        _dl_last[uid] = time.time()
+        try:
+            await bot.send_document(
+                uid,
+                BufferedInputFile(post["prompt"].encode("utf-8-sig"), filename=f"prompt_{post['id']}.txt"),
+                caption=f"Ваш промт 💛\nОткройте файл и скопируйте текст.\n\n{SIGN}",
+            )
+            await send_saver_promo(bot, uid)
+        except Exception as e:
+            log.warning("отправка промта из мини-приложения: %s", e)
+            return web.json_response({"ok": False, "error": "send_failed"}, status=500)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    app.router.add_get("/app", page)
+    app.router.add_get("/health", lambda r: web.Response(text="ok"))
+    app.router.add_post("/api/open", api_open)
+    app.router.add_post("/api/photo", api_photo)
+    app.router.add_post("/api/download", api_download)
+    return app
+
+
 async def main():
     global BOT_USERNAME
     if not BOT_TOKEN:
@@ -2064,6 +2285,16 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Бот @%s запущен", BOT_USERNAME)
+    runner = None
+    if WEBAPP_URL:
+        from aiohttp import web
+
+        runner = web.AppRunner(make_web_app(bot))
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+        log.info("Мини-приложение: %s (порт %s)", WEBAPP_URL, PORT)
+    else:
+        log.warning("WEBAPP_URL не задан — промт выдаётся в чат, без мини-приложения")
     task = None
     if GH_ENABLED:
         log.info("GitHub-бэкап включён: %s", GITHUB_REPO)
@@ -2073,6 +2304,8 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        if runner:
+            await runner.cleanup()
         if task:
             task.cancel()
             await gh_backup()  # финальное сохранение при остановке
