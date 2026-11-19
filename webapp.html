@@ -11,124 +11,191 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#07080c;
-    --surface:#0e1118;
-    --surface-2:#141926;
-    --line:rgba(255,255,255,.08);
-    --line-strong:rgba(255,255,255,.14);
-    --text:#e9ebf1;
-    --muted:#8a92a6;
-    --gold:#d8b76e;
-    --gold-deep:#b68d43;
-    --gold-soft:rgba(216,183,110,.12);
-    --ok:#6fcf97;
-    --err:#ff7a7a;
-    --r:18px;
+    --bg:#07080c; --surface:#0e1118; --surface-2:#141926;
+    --line:rgba(255,255,255,.08); --line-strong:rgba(255,255,255,.14);
+    --text:#e9ebf1; --muted:#8a92a6;
+    --gold:#d8b76e; --gold-deep:#b68d43; --gold-soft:rgba(216,183,110,.12);
+    --ok:#6fcf97; --err:#ff7a7a; --r:18px;
     --safe-b:env(safe-area-inset-bottom,0px);
+    --tab-h:66px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{margin:0;background:var(--bg);color:var(--text);
-    font-family:Inter,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
-    -webkit-font-smoothing:antialiased}
-  body{min-height:100vh;
-    background:
-      radial-gradient(600px 320px at 50% -80px,rgba(216,183,110,.10),transparent 70%),
-      var(--bg)}
+    font-family:Inter,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+  body{min-height:100vh;background:radial-gradient(600px 320px at 50% -80px,rgba(216,183,110,.10),transparent 70%),var(--bg)}
   svg{display:block;flex:none}
-  button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+  button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;padding:0}
+  [hidden]{display:none!important}
 
-  /* ───────── экран загрузки ───────── */
-  #splash{position:fixed;inset:0;z-index:50;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  /* ───── загрузка ───── */
+  #splash{position:fixed;inset:0;z-index:80;display:flex;flex-direction:column;align-items:center;justify-content:center;
     gap:26px;background:var(--bg);transition:opacity .5s ease,visibility .5s}
   #splash.hide{opacity:0;visibility:hidden}
   .ring{position:relative;width:168px;height:168px}
   .ring svg{width:100%;height:100%;transform:rotate(-90deg)}
   .ring .track{stroke:var(--line);fill:none;stroke-width:3}
-  .ring .bar{stroke:url(#g);fill:none;stroke-width:3;stroke-linecap:round;
-    stroke-dasharray:452.4;stroke-dashoffset:452.4}
+  .ring .bar{stroke:url(#g);fill:none;stroke-width:3;stroke-linecap:round;stroke-dasharray:452.4;stroke-dashoffset:452.4}
   .ring .pct{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     font-size:40px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
   .ring .pct small{font-size:16px;color:var(--muted);margin-left:2px;font-weight:500}
   .splash-title{font-size:13px;letter-spacing:.32em;color:var(--muted);font-weight:500;text-transform:uppercase}
-  .splash-step{height:18px;font-size:13px;color:var(--gold);transition:opacity .25s}
+  .splash-step{height:18px;font-size:13px;color:var(--gold)}
 
-  /* ───────── страница ───────── */
-  .page{max-width:520px;margin:0 auto;padding:22px 16px calc(28px + var(--safe-b));
+  /* ───── каркас ───── */
+  .page{max-width:520px;margin:0 auto;padding:14px 16px calc(var(--tab-h) + 34px + var(--safe-b));
     opacity:0;transform:translateY(10px);transition:opacity .6s ease .1s,transform .6s ease .1s}
   .page.show{opacity:1;transform:none}
+  .page.no-tabs{padding-bottom:calc(28px + var(--safe-b))}
 
-  header{display:flex;align-items:center;justify-content:center;gap:14px;margin:6px 0 22px}
-  header i{flex:1;height:1px;max-width:64px;background:linear-gradient(90deg,transparent,var(--line-strong))}
-  header i:last-child{background:linear-gradient(270deg,transparent,var(--line-strong))}
-  header h1{margin:0;font-size:19px;font-weight:600;letter-spacing:.34em;padding-left:.34em;
-    background:linear-gradient(180deg,#f3e3b8,var(--gold) 55%,var(--gold-deep));
-    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .top{display:grid;grid-template-columns:84px 1fr 84px;align-items:center;margin:0 0 20px}
+  .back{justify-self:start;display:flex;align-items:center;gap:4px;height:36px;padding:0 12px 0 8px;border-radius:12px;
+    font-size:13.5px;font-weight:500;color:var(--text);background:rgba(255,255,255,.05);border:1px solid var(--line)}
+  .back:active{background:rgba(255,255,255,.1)}
+  .back svg{width:18px;height:18px}
+  .ttl{text-align:center}
+  .ttl h1{margin:0;font-size:16px;font-weight:600;letter-spacing:.24em;padding-left:.24em;white-space:nowrap;
+    background:linear-gradient(180deg,#f3e3b8,var(--gold) 55%,var(--gold-deep));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .ttl span{display:block;margin-top:4px;font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);font-weight:500}
 
-  .card{background:linear-gradient(180deg,var(--surface-2),var(--surface));
-    border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
-  .card-head{display:flex;align-items:center;gap:10px;padding:13px 14px 0}
+  .card{background:linear-gradient(180deg,var(--surface-2),var(--surface));border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .card-head{display:flex;align-items:center;gap:10px}
   .badge{width:30px;height:30px;border-radius:9px;background:var(--gold-soft);color:var(--gold);
     display:flex;align-items:center;justify-content:center;border:1px solid rgba(216,183,110,.18)}
   .badge svg{width:16px;height:16px}
   .label{font-size:11.5px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
   .grow{flex:1}
 
-  /* совет: слева квадрат с фото, справа текст */
+  /* ───── сетка публикаций ───── */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .pcard{display:flex;flex-direction:column;gap:9px;padding:8px;border-radius:var(--r);
+    background:linear-gradient(180deg,var(--surface-2),var(--surface));border:1px solid var(--line)}
+  .pph{position:relative;aspect-ratio:3/4;border-radius:13px;overflow:hidden;background:var(--surface-2)}
+  .pph img{width:100%;height:100%;object-fit:cover;display:block}
+  .ph-empty{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .ph-empty svg{width:28px;height:28px}
+  .heart{position:absolute;top:7px;right:7px;width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;
+    background:rgba(7,8,12,.55);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);color:#fff}
+  .heart svg{width:16px;height:16px}
+  .heart svg,.btn-fav svg,.tab svg.fillable{fill:none}
+  .heart.on{color:var(--gold)} .heart.on svg{fill:currentColor}
+  .pmeta{display:flex;align-items:center;justify-content:space-between;padding:0 3px}
+  .chip{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--gold);
+    background:var(--gold-soft);border:1px solid rgba(216,183,110,.18);padding:3px 8px;border-radius:7px}
+  .date{font-size:11.5px;color:var(--muted)}
+  .btn-sm{height:38px;border-radius:11px;font-size:13.5px;font-weight:600;color:var(--text);
+    background:rgba(255,255,255,.06);border:1px solid var(--line-strong);transition:background .2s}
+  .btn-sm:active{background:rgba(255,255,255,.12)}
+
+  .empty{text-align:center;padding:60px 24px;color:var(--muted);font-size:14px;line-height:1.6}
+  .empty .badge{width:50px;height:50px;border-radius:15px;margin:0 auto 16px}
+  .empty .badge svg{width:22px;height:22px}
+  .empty b{display:block;color:var(--text);font-size:16px;font-weight:600;margin-bottom:6px}
+
+  /* ───── подробный экран ───── */
   .tip{margin-bottom:14px;padding:14px}
   .tip-row{display:flex;gap:14px;align-items:center}
-  .tip-photo{flex:none;width:112px;height:112px;border-radius:16px;overflow:hidden;display:none;
-    background:var(--surface-2)}
+  .tip-photo{flex:none;width:112px;height:112px;border-radius:16px;overflow:hidden;display:none;background:var(--surface-2)}
   .tip-photo.on{display:block}
   .tip-photo img{width:100%;height:100%;object-fit:cover;display:block}
   .tip-main{flex:1;min-width:0}
-  .tip-main .card-head{padding:0;margin-bottom:8px}
+  .tip-main .card-head{margin-bottom:8px}
   .tip-main .badge{width:26px;height:26px;border-radius:8px}
   .tip-main .badge svg{width:14px;height:14px}
   .tip p{margin:0;font-size:13.5px;line-height:1.55;color:#c6cad6}
   .tip p b{color:var(--text);font-weight:600}
 
-  /* кнопка скачать */
-  .btn-main{width:100%;height:54px;border-radius:15px;margin-bottom:14px;position:relative;overflow:hidden;
-    display:flex;align-items:center;justify-content:center;gap:10px;
-    font-size:15.5px;font-weight:600;letter-spacing:.01em;color:#17120a;
+  .actions{display:flex;gap:10px;margin-bottom:14px}
+  .btn-main{flex:1;height:54px;border-radius:15px;display:flex;align-items:center;justify-content:center;gap:10px;
+    font-size:15.5px;font-weight:600;color:#17120a;
     background:linear-gradient(180deg,#e6c987,var(--gold) 50%,var(--gold-deep));
-    box-shadow:0 10px 28px -12px rgba(216,183,110,.55),inset 0 1px 0 rgba(255,255,255,.35);
-    transition:transform .15s ease,filter .2s}
+    box-shadow:0 10px 28px -12px rgba(216,183,110,.55),inset 0 1px 0 rgba(255,255,255,.35);transition:transform .15s,filter .2s}
   .btn-main:active{transform:scale(.985);filter:brightness(.95)}
   .btn-main svg{width:19px;height:19px}
   .btn-main[disabled]{filter:saturate(.6) brightness(.9);cursor:default}
-  .spin{width:18px;height:18px;border-radius:50%;border:2px solid rgba(23,18,10,.25);border-top-color:#17120a;
-    animation:sp .7s linear infinite}
+  .btn-fav{flex:none;width:54px;height:54px;border-radius:15px;display:flex;align-items:center;justify-content:center;
+    background:rgba(255,255,255,.05);border:1px solid var(--line-strong);color:var(--text);transition:all .2s}
+  .btn-fav svg{width:21px;height:21px}
+  .btn-fav.on{color:var(--gold);border-color:rgba(216,183,110,.45);background:var(--gold-soft)}
+  .btn-fav.on svg{fill:currentColor}
+  .spin{width:18px;height:18px;border-radius:50%;border:2px solid rgba(23,18,10,.25);border-top-color:#17120a;animation:sp .7s linear infinite}
   @keyframes sp{to{transform:rotate(360deg)}}
 
-  /* промт */
   .prompt-head{padding:12px 12px 12px 14px;border-bottom:1px solid var(--line)}
-  .btn-copy{display:flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:10px;
-    font-size:13px;font-weight:500;color:var(--text);background:rgba(255,255,255,.05);
-    border:1px solid var(--line-strong);transition:background .2s,color .2s,border-color .2s}
+  .btn-copy{display:flex;align-items:center;gap:7px;height:34px;padding:0 12px;border-radius:10px;font-size:13px;font-weight:500;
+    background:rgba(255,255,255,.05);border:1px solid var(--line-strong);transition:all .2s}
   .btn-copy:active{background:rgba(255,255,255,.1)}
   .btn-copy svg{width:15px;height:15px}
   .btn-copy.done{color:var(--ok);border-color:rgba(111,207,151,.4);background:rgba(111,207,151,.08)}
-  .prompt-body{padding:16px;font-size:14.5px;line-height:1.7;color:#dfe2ea;white-space:pre-wrap;
-    word-break:break-word;user-select:text;-webkit-user-select:text}
+  .prompt-body{padding:16px;font-size:14.5px;line-height:1.7;color:#dfe2ea;white-space:pre-wrap;word-break:break-word;user-select:text;-webkit-user-select:text}
+
+  /* ───── подписки ───── */
+  .subs-card{padding:18px 16px}
+  .subs-card h2{margin:0 0 6px;font-size:17px;font-weight:600}
+  .subs-card p{margin:0 0 16px;font-size:14px;line-height:1.55;color:var(--muted)}
+  .sub-link{display:flex;align-items:center;gap:12px;width:100%;padding:12px;margin-bottom:9px;border-radius:13px;text-align:left;
+    background:rgba(255,255,255,.04);border:1px solid var(--line-strong);font-size:14.5px;font-weight:500}
+  .sub-link .badge{width:34px;height:34px}
+  .sub-link>span:not(.badge){flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sub-link svg.arr{width:16px;height:16px;color:var(--muted)}
+
+  /* ───── профиль ───── */
+  .me{display:flex;flex-direction:column;align-items:center;padding:26px 16px 22px;margin-bottom:14px;text-align:center}
+  .ava{width:92px;height:92px;border-radius:50%;overflow:hidden;margin-bottom:14px;display:flex;align-items:center;justify-content:center;
+    background:var(--gold-soft);border:2px solid rgba(216,183,110,.5);box-shadow:0 0 0 5px rgba(216,183,110,.08);
+    font-size:34px;font-weight:600;color:var(--gold)}
+  .ava img{width:100%;height:100%;object-fit:cover;display:block}
+  .me h2{margin:0;font-size:20px;font-weight:600;letter-spacing:-.01em}
+  .me .un{margin-top:4px;font-size:14px;color:var(--muted)}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+  .stat{padding:16px 14px;text-align:center}
+  .stat b{display:block;font-size:28px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .stat span{display:block;margin-top:4px;font-size:12px;color:var(--muted);line-height:1.35}
+  .btn-share{width:100%;margin-bottom:26px}
+  .sect-label{margin:0 4px 10px;font-size:11.5px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  .thanks-btn{width:100%;display:flex;align-items:center;gap:14px;padding:16px;text-align:left;border-radius:var(--r);
+    background:linear-gradient(180deg,rgba(216,183,110,.10),rgba(216,183,110,.03));border:1px solid rgba(216,183,110,.35);transition:background .2s}
+  .thanks-btn:active{background:rgba(216,183,110,.14)}
+  .thanks-btn .badge{width:40px;height:40px;border-radius:12px}
+  .thanks-btn .badge svg{width:20px;height:20px}
+  .thanks-btn div{flex:1}
+  .thanks-btn b{display:block;font-size:15px;font-weight:600;color:var(--gold)}
+  .thanks-btn small{display:block;margin-top:4px;font-size:13px;line-height:1.45;color:#c6cad6}
+  .thanks-btn svg.arr{width:18px;height:18px;color:var(--gold)}
+
+  .pay{display:flex;align-items:center;gap:14px;padding:16px;margin-bottom:12px}
+  .pay .badge{width:40px;height:40px;border-radius:12px}
+  .pay div{flex:1}
+  .pay small{display:block;font-size:12px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;font-weight:600}
+  .pay b{display:block;margin-top:3px;font-size:19px;font-weight:600;letter-spacing:.03em;font-variant-numeric:tabular-nums}
+  .note{margin:6px 6px 0;text-align:center;font-size:13.5px;line-height:1.55;color:var(--muted)}
 
   footer{margin-top:22px;text-align:center;font-size:12px;color:var(--muted)}
   footer a{color:var(--gold);text-decoration:none;font-weight:500}
 
-  .error{display:none;text-align:center;padding:46px 22px}
-  .error.on{display:block}
-  .error .badge{width:48px;height:48px;border-radius:14px;margin:0 auto 16px;color:var(--err);
-    background:rgba(255,122,122,.09);border-color:rgba(255,122,122,.2)}
+  /* ───── нижняя панель ───── */
+  .tabbar{position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;justify-content:center;
+    padding:0 12px calc(10px + var(--safe-b));pointer-events:none}
+  .tabbar nav{pointer-events:auto;display:flex;width:100%;max-width:496px;height:var(--tab-h);padding:6px;border-radius:22px;
+    background:rgba(16,19,28,.86);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+    border:1px solid var(--line-strong);box-shadow:0 16px 40px -10px rgba(0,0,0,.8)}
+  .tab{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:16px;
+    color:var(--muted);font-size:11px;font-weight:500;letter-spacing:.02em;transition:all .25s}
+  .tab svg{width:21px;height:21px}
+  .tab.on{color:var(--gold);background:var(--gold-soft)}
+  .tab.on svg.fillable{fill:currentColor}
+
+  /* ───── ошибка / тост ───── */
+  .error{text-align:center;padding:70px 22px}
+  .error .badge{width:48px;height:48px;border-radius:14px;margin:0 auto 16px;color:var(--err);background:rgba(255,122,122,.09);border-color:rgba(255,122,122,.2)}
   .error .badge svg{width:22px;height:22px}
   .error h2{margin:0 0 8px;font-size:17px;font-weight:600}
   .error p{margin:0 0 20px;color:var(--muted);font-size:14px;line-height:1.55}
-  .btn-ghost{height:44px;padding:0 20px;border-radius:12px;border:1px solid var(--line-strong);
-    background:rgba(255,255,255,.04);font-size:14px;font-weight:500}
+  .btn-ghost{height:44px;padding:0 20px;border-radius:12px;border:1px solid var(--line-strong);background:rgba(255,255,255,.04);font-size:14px;font-weight:500}
 
-  #toast{position:fixed;left:50%;bottom:calc(26px + var(--safe-b));transform:translate(-50%,20px);opacity:0;
+  #toast{position:fixed;left:50%;bottom:calc(var(--tab-h) + 28px + var(--safe-b));transform:translate(-50%,20px);opacity:0;
     display:flex;align-items:center;gap:9px;padding:11px 16px;border-radius:13px;font-size:13.5px;font-weight:500;
     background:rgba(24,29,42,.96);border:1px solid var(--line-strong);backdrop-filter:blur(10px);
-    box-shadow:0 14px 40px -12px rgba(0,0,0,.7);transition:all .3s ease;pointer-events:none;z-index:60;white-space:nowrap}
+    box-shadow:0 14px 40px -12px rgba(0,0,0,.7);transition:all .3s ease;pointer-events:none;z-index:90;white-space:nowrap}
   #toast.on{opacity:1;transform:translate(-50%,0)}
   #toast svg{width:16px;height:16px;color:var(--ok)}
   #toast.bad svg{color:var(--err)}
@@ -136,29 +203,29 @@
 </head>
 <body>
 
-<!-- иконки (stroke, в стиле Lucide) -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f1dca6"/><stop offset="1" stop-color="#b68d43"/>
-    </linearGradient>
-    <symbol id="i-bulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/>
-      <path d="M9 18h6"/><path d="M10 22h4"/></symbol>
-    <symbol id="i-dl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
-    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect width="14" height="14" x="8" y="8" rx="2.5"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
-    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M20 6 9 17l-5-5"/></symbol>
-    <symbol id="i-text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M4 7V5h16v2"/><path d="M9 19h6"/><path d="M12 5v14"/></symbol>
-    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16.5v.01"/></symbol>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f1dca6"/><stop offset="1" stop-color="#b68d43"/></linearGradient>
+    <g id="s" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"></g>
+    <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-arr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7Z"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></symbol>
+    <symbol id="i-bulb" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></symbol>
+    <symbol id="i-dl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2.5"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V5h16v2"/><path d="M9 19h6"/><path d="M12 5v14"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16.5v.01"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.8"/><path d="m21 15-4.5-4.5L6 21"/></symbol>
+    <symbol id="i-chan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m3 11 18-8-6 18-3-7.5Z"/><path d="m12 13.5 9-10.5"/></symbol>
+    <symbol id="i-bot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4"/><circle cx="12" cy="3.5" r="1"/><path d="M9 14v.01M15 14v.01"/></symbol>
+    <symbol id="i-gift" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></symbol>
   </defs>
 </svg>
 
-<!-- загрузка -->
 <div id="splash">
   <div class="ring">
     <svg viewBox="0 0 160 160"><circle class="track" cx="80" cy="80" r="72"/><circle class="bar" id="bar" cx="80" cy="80" r="72"/></svg>
@@ -169,45 +236,99 @@
 </div>
 
 <main class="page" id="page">
-  <header><i></i><h1>PROMPT TAJ</h1><i></i></header>
+  <div class="top" id="top">
+    <button class="back" id="backBtn" type="button"><svg><use href="#i-back"/></svg>Назад</button>
+    <div class="ttl"><h1>PROMPT TAJ</h1><span id="sub">Публикации</span></div>
+    <i></i>
+  </div>
 
-  <div id="content" hidden>
-    <section class="card tip" id="tip">
+  <!-- Публикации -->
+  <section id="v-posts" hidden><div class="grid" id="g-posts"></div></section>
+
+  <!-- Избранное -->
+  <section id="v-fav" hidden><div class="grid" id="g-fav"></div></section>
+
+  <!-- Профиль -->
+  <section id="v-profile" hidden>
+    <div class="card me">
+      <div class="ava" id="ava"></div>
+      <h2 id="meName"></h2>
+      <div class="un" id="meUser"></div>
+    </div>
+    <div class="stats">
+      <div class="card stat"><b id="stInv">0</b><span>друзей зашли<br>по вашей ссылке</span></div>
+      <div class="card stat"><b id="stGot">0</b><span>промтов<br>получено</span></div>
+    </div>
+    <button class="btn-main btn-share" id="shareBtn" type="button"><svg><use href="#i-share"/></svg>Поделиться ботом</button>
+    <div class="sect-label">Благодарность</div>
+    <button class="thanks-btn" id="thanksBtn" type="button">
+      <span class="badge"><svg><use href="#i-heart"/></svg></span>
+      <div><b>Оставить благодарность · 1 TJS</b><small>Ваша благодарность поможет нам подняться, спасибо ☺️</small></div>
+      <svg class="arr"><use href="#i-arr"/></svg>
+    </button>
+    <footer>Автор — <a href="https://t.me/IDIEVW" id="owner">@IDIEVW</a></footer>
+  </section>
+
+  <!-- Промт -->
+  <section id="v-detail" hidden>
+    <section class="card tip">
       <div class="tip-row">
         <div class="tip-photo" id="tipPhoto"><img id="tipImg" alt=""></div>
         <div class="tip-main">
-          <div class="card-head">
-            <div class="badge"><svg><use href="#i-bulb"/></svg></div>
-            <span class="label">Совет</span>
-          </div>
+          <div class="card-head"><div class="badge"><svg><use href="#i-bulb"/></svg></div><span class="label">Совет</span></div>
           <p id="tipText"></p>
         </div>
       </div>
     </section>
-
-    <button class="btn-main" id="dl" type="button">
-      <svg><use href="#i-dl"/></svg><span id="dlText">Скачать промт</span>
-    </button>
-
+    <div class="actions">
+      <button class="btn-main" id="dl" type="button"><svg><use href="#i-dl"/></svg><span id="dlText">Скачать промт</span></button>
+      <button class="btn-fav" id="favBtn" type="button" aria-label="В избранное"><svg><use href="#i-heart"/></svg></button>
+    </div>
     <section class="card">
       <div class="card-head prompt-head">
-        <div class="badge"><svg><use href="#i-text"/></svg></div>
-        <span class="label grow">Промт</span>
+        <div class="badge"><svg><use href="#i-text"/></svg></div><span class="label grow">Промт</span>
         <button class="btn-copy" id="copy" type="button"><svg><use href="#i-copy"/></svg><span id="copyText">Копировать</span></button>
       </div>
       <div class="prompt-body" id="prompt"></div>
     </section>
+  </section>
 
-    <footer>Автор — <a href="https://t.me/IDIEVW" id="owner">@IDIEVW</a></footer>
-  </div>
+  <!-- Подписки -->
+  <section id="v-subs" hidden>
+    <div class="card subs-card">
+      <h2>Сначала подпишитесь</h2>
+      <p>Чтобы открыть этот промт, подпишитесь на каналы и запустите ботов ниже, затем нажмите «Проверить».</p>
+      <div id="subsList"></div>
+      <button class="btn-main" id="subsCheck" type="button" style="width:100%;margin-top:6px"><svg><use href="#i-check"/></svg>Проверить</button>
+    </div>
+  </section>
 
-  <section class="error" id="error">
+  <!-- Благодарность -->
+  <section id="v-thanks" hidden>
+    <div class="pay card"><span class="badge"><svg><use href="#i-gift"/></svg></span>
+      <div><small>DC City</small><b>978117811</b></div>
+      <button class="btn-copy" data-num="978117811" type="button"><svg><use href="#i-copy"/></svg><span>Копировать</span></button></div>
+    <div class="pay card"><span class="badge"><svg><use href="#i-gift"/></svg></span>
+      <div><small>Alif Mobi</small><b>978117811</b></div>
+      <button class="btn-copy" data-num="978117811" type="button"><svg><use href="#i-copy"/></svg><span>Копировать</span></button></div>
+    <p class="note">Спасибо, что поддерживаете нас ☺️</p>
+  </section>
+
+  <!-- Ошибка -->
+  <section class="error" id="error" hidden>
     <div class="badge"><svg><use href="#i-alert"/></svg></div>
-    <h2 id="errTitle">Не удалось открыть промт</h2>
-    <p id="errText"></p>
+    <h2 id="errTitle"></h2><p id="errText"></p>
     <button class="btn-ghost" id="retry" type="button">Повторить</button>
   </section>
 </main>
+
+<div class="tabbar" id="tabbar" hidden>
+  <nav>
+    <button class="tab" data-tab="posts" type="button"><svg><use href="#i-grid"/></svg>Публикации</button>
+    <button class="tab" data-tab="fav" type="button"><svg class="fillable"><use href="#i-heart"/></svg>Избранное</button>
+    <button class="tab" data-tab="profile" type="button"><svg><use href="#i-user"/></svg>Профиль</button>
+  </nav>
+</div>
 
 <div id="toast"><svg><use href="#i-check"/></svg><span id="toastText"></span></div>
 
@@ -216,16 +337,17 @@
   const tg = window.Telegram && Telegram.WebApp;
   const $ = id => document.getElementById(id);
   const qs = new URLSearchParams(location.search);
-  const DEMO = qs.get('demo') === '1';               // предпросмотр дизайна вне Telegram
-  const POST = parseInt(qs.get('p') || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || '0', 10);
+  const DEMO = qs.get('demo') === '1';
+  const START_POST = parseInt(qs.get('p') || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || '0', 10) || 0;
   const initData = (tg && tg.initData) || '';
+  const tgUser = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || (DEMO ? {id:1,first_name:'Али',last_name:'Рахимов',username:'ali_rh'} : {});
 
   const TIPS = {
-    single: 'Загружай одновременно <b>2 фотографии</b>: свою фото, а также это фото как референс. ' +
-            'Так генератору будет проще сохранить ваше лицо и повторить позу.',
-    pair:   'Загружай одновременно <b>2 фотографии</b>: свою и девушки, а также это фото как референс. ' +
-            'Так генератору будет проще сохранить ваши лица и повторить позу.'
+    single: 'Загружай одновременно <b>2 фотографии</b>: свою фото, а также это фото как референс. Так генератору будет проще сохранить ваше лицо и повторить позу.',
+    pair:   'Загружай одновременно <b>2 фотографии</b>: свою и девушки, а также это фото как референс. Так генератору будет проще сохранить ваши лица и повторить позу.'
   };
+  const SUBS = {posts:'Публикации', fav:'Избранное', profile:'Профиль', detail:'Промт', subs:'Подписка', thanks:'Благодарность'};
+  const TABS = ['posts','fav','profile'];
 
   if (tg) {
     try { tg.ready(); tg.expand(); } catch(e){}
@@ -233,8 +355,8 @@
     try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch(e){}
   }
   const haptic = t => { try { tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred(t); } catch(e){} };
+  const tap = () => { try { tg && tg.HapticFeedback && tg.HapticFeedback.selectionChanged(); } catch(e){} };
 
-  /* ── тост ── */
   let tt;
   function toast(text, bad){
     const el = $('toast'); $('toastText').textContent = text;
@@ -243,126 +365,202 @@
   }
 
   /* ── загрузка в процентах ── */
-  const C = 452.4;
-  let shown = 0, target = 0, raf;
-  const steps = [[0,'Подключение…'],[28,'Регистрация профиля…'],[58,'Подготовка промта…'],[88,'Почти готово…']];
+  const C = 452.4; let shown = 0, target = 0;
+  const steps = [[0,'Подключение…'],[28,'Регистрация профиля…'],[58,'Загрузка данных…'],[88,'Почти готово…']];
   function paint(p){
-    $('bar').style.strokeDashoffset = C * (1 - p/100);
-    $('pct').textContent = Math.round(p);
+    $('bar').style.strokeDashoffset = C * (1 - p/100); $('pct').textContent = Math.round(p);
     let s = steps[0][1]; steps.forEach(x => { if (p >= x[0]) s = x[1]; });
     if ($('step').textContent !== s) $('step').textContent = s;
   }
+  let splashDone = null;
   function tick(){
-    shown += (target - shown) * 0.06 + 0.12;
-    if (shown > target) shown = target;
-    paint(shown);
-    if (shown < 100) raf = requestAnimationFrame(tick); else finishSplash();
+    shown += (target - shown) * 0.06 + 0.12; if (shown > target) shown = target; paint(shown);
+    if (shown < 100) requestAnimationFrame(tick);
+    else { $('step').textContent = 'Готово'; setTimeout(()=>{ $('splash').classList.add('hide'); $('page').classList.add('show'); splashDone && splashDone(); }, 250); }
   }
-  function setTarget(t){ target = Math.max(target, t); }
-  let crawl = setInterval(()=>{ if (target < 90) target += 1.4; }, 60);   // ползёт до 90, пока идёт запрос
-  function finishSplash(){
-    $('step').textContent = 'Готово';
-    setTimeout(()=>{ $('splash').classList.add('hide'); $('page').classList.add('show'); }, 250);
-  }
-  raf = requestAnimationFrame(tick);
+  const crawl = setInterval(()=>{ if (target < 90) target += 1.4; }, 60);
+  const finishSplash = () => { clearInterval(crawl); target = 100; };
+  requestAnimationFrame(tick);
 
-  /* ── API ── */
+  /* ── API (в демо-режиме — заглушки) ── */
+  function demoPhoto(i){
+    const c=[['#5b4636','#1d1710'],['#3d4a5c','#10151c'],['#5c3d4a','#1c1015'],['#3d5c4f','#10201a'],['#5c5a3d','#1c1b10'],['#4a3d5c','#15101c']][i%6];
+    return 'data:image/svg+xml;utf8,'+encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400"><defs><linearGradient id="a" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${c[0]}"/><stop offset="1" stop-color="${c[1]}"/></linearGradient></defs><rect width="300" height="400" fill="url(#a)"/><circle cx="150" cy="150" r="58" fill="rgba(255,255,255,.14)"/><rect x="70" y="230" width="160" height="170" rx="80" fill="rgba(255,255,255,.14)"/></svg>`);
+  }
+  const demoFav = new Set([2]);
+  async function demoApi(path, body){
+    await new Promise(r => setTimeout(r, 250));
+    if (path === '/api/profile') return {ok:true, invited:7, got:12, link:'https://t.me/demo_bot?start=ref1'};
+    if (path === '/api/list') {
+      let items = [1,2,3,4,5,6].map(i => ({id:i, kind:i%2?'single':'pair', created:1763500000 - i*86400, has_photo:true, fav:demoFav.has(i)}));
+      if (body.fav) items = items.filter(x => x.fav); return {ok:true, items};
+    }
+    if (path === '/api/post') {
+      if (body.post === 99) throw Object.assign(new Error('need_subs'), {code:'need_subs', subs:[{title:'PROMPT TAJ',link:'https://t.me/tajpromt',kind:'channel'},{title:'Taj Saver Bot',link:'https://t.me/Taj_Saverbot',kind:'bot'}]});
+      return {ok:true, kind:body.post%2?'single':'pair', has_photo:true, fav:demoFav.has(body.post),
+        prompt:'Используй приложенное фото моего лица как эталон личности: сохрани лицо, тон кожи, возраст и черты без изменений. Помести этого человека в сцену: вертикальный портрет по пояс, мягкий боковой свет из окна слева, тёплая цветовая гамма, глубина резкости как у объектива 85 мм, лёгкое зерно плёнки. Поза — вполоборота, взгляд в камеру. Одежда: тёмно-серое пальто из шерсти, под ним чёрная водолазка. Фон — размытая вечерняя улица с тёплыми огнями.'};
+    }
+    if (path === '/api/fav') { body.on ? demoFav.add(body.post) : demoFav.delete(body.post); return {ok:true, fav:body.on}; }
+    return {ok:true};
+  }
   async function api(path, body){
-    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(Object.assign({initData, post: POST}, body||{}))});
+    body = Object.assign({post:0}, body||{});
+    if (DEMO) return demoApi(path, body);
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(Object.assign({initData}, body))});
     let j = {}; try { j = await r.json(); } catch(e){}
-    if (!r.ok || !j.ok) { const e = new Error(j.error || ('http_' + r.status)); e.code = j.error || r.status; throw e; }
+    if (!r.ok || !j.ok) { const e = new Error(j.error || ('http_' + r.status)); e.code = j.error || r.status; e.subs = j.subs; throw e; }
     return j;
   }
+  const photoUrl = id => DEMO ? demoPhoto(id) : `/api/photo?post=${id}&d=${encodeURIComponent(initData)}`;
 
-  const ERRS = {
-    no_claim: ['Промт ещё не получен', 'Вернитесь в бота, выполните подписки и нажмите «Получить промт» ещё раз.'],
-    bad_init: ['Нужно открыть через Telegram', 'Откройте это окно кнопкой «Открыть» в чате с ботом.'],
-    no_post:  ['Публикация не найдена', 'Возможно, она была удалена.'],
-    default:  ['Не удалось открыть промт', 'Проверьте интернет и попробуйте ещё раз.']
-  };
+  /* ── навигация ── */
+  let cur = null, prevView = 'posts', me = null, curPost = null, subsPost = null;
+  const VIEWS = ['posts','fav','profile','detail','subs','thanks'];
+  function show(v){
+    cur = v;
+    VIEWS.forEach(x => $('v-'+x).hidden = (x !== v));
+    $('error').hidden = true;
+    const isTab = TABS.includes(v);
+    $('tabbar').hidden = !isTab; $('page').classList.toggle('no-tabs', !isTab);
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === v));
+    $('sub').textContent = SUBS[v];
+    if (isTab) prevView = v;
+    window.scrollTo(0,0);
+    if (v === 'posts' || v === 'fav') loadList(v);
+    if (v === 'profile') renderProfile();
+  }
+  function goBack(){
+    if (!TABS.includes(cur)) return show(prevView || 'posts');
+    if (cur !== 'posts') return show('posts');
+    if (tg && tg.close) tg.close(); else history.back();
+  }
+  $('backBtn').onclick = goBack;
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => { tap(); show(t.dataset.tab); });
+
   function showError(code){
-    const [t, d] = ERRS[code] || ERRS.default;
+    const M = {bad_init:['Нужно открыть через Telegram','Откройте это окно кнопкой «Открыть» или «Приложение» в чате с ботом.'],
+               no_post:['Публикация не найдена','Возможно, она была удалена.']};
+    const [t,d] = M[code] || ['Не удалось загрузить','Проверьте интернет и попробуйте ещё раз.'];
     $('errTitle').textContent = t; $('errText').textContent = d;
-    $('content').hidden = true; $('error').classList.add('on');
+    cur = 'error'; VIEWS.forEach(x => $('v-'+x).hidden = true); $('tabbar').hidden = true; $('error').hidden = false;
   }
 
-  async function load(){
-    $('error').classList.remove('on');
-    let data;
+  /* ── списки ── */
+  const fmt = ts => new Date(ts*1000).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'});
+  const cardHTML = it => `<article class="pcard" data-id="${it.id}">
+    <div class="pph">${it.has_photo ? `<img loading="lazy" src="${photoUrl(it.id)}" alt="">` : `<div class="ph-empty"><svg><use href="#i-image"/></svg></div>`}
+      <button class="heart${it.fav?' on':''}" data-fav="${it.id}" type="button" aria-label="В избранное"><svg><use href="#i-heart"/></svg></button></div>
+    <div class="pmeta"><span class="chip">${it.kind==='pair'?'Пара':'Одиночка'}</span><span class="date">${fmt(it.created)}</span></div>
+    <button class="btn-sm" data-open="${it.id}" type="button">Посмотреть</button></article>`;
+  const emptyHTML = fav => `<div class="empty" style="grid-column:1/-1"><div class="badge"><svg><use href="#i-${fav?'heart':'grid'}"/></svg></div>
+    <b>${fav?'В избранном пока пусто':'Публикаций пока нет'}</b>${fav?'Нажмите ♥ на понравившемся промте — он появится здесь.':'Загляните чуть позже.'}</div>`;
+
+  async function loadList(kind){
+    const box = $(kind === 'fav' ? 'g-fav' : 'g-posts');
     try {
-      if (DEMO) {
-        await new Promise(r => setTimeout(r, 1400));
-        data = {kind: qs.get('kind') === 'pair' ? 'pair' : 'single', has_photo: false,
-          prompt: 'Используй приложенное фото моего лица как эталон личности: сохрани лицо, тон кожи, возраст и черты без изменений. ' +
-                  'Помести этого человека в сцену: вертикальный портрет по пояс, мягкий боковой свет из окна слева, тёплая цветовая гамма, ' +
-                  'глубина резкости как у объектива 85 мм, лёгкое зерно плёнки. Поза — вполоборота, взгляд в камеру, правая рука у воротника. ' +
-                  'Одежда: тёмно-серое пальто из шерсти, под ним чёрная водолазка. Фон — размытая вечерняя улица с тёплыми огнями.'};
-      } else {
-        if (!POST) throw Object.assign(new Error('no_post'), {code:'no_post'});
-        data = await api('/api/open');
-      }
-    } catch (e) {
-      clearInterval(crawl); setTarget(100);
-      setTimeout(()=>showError(e.code), 400);
-      return;
+      const j = await api('/api/list', {fav: kind === 'fav'});
+      box.innerHTML = j.items.length ? j.items.map(cardHTML).join('') : emptyHTML(kind === 'fav');
+    } catch(e){ if (e.code === 'bad_init') showError('bad_init'); else if (!box.innerHTML) box.innerHTML = emptyHTML(kind === 'fav'); }
+  }
+  ['g-posts','g-fav'].forEach(id => $(id).addEventListener('click', async ev => {
+    const h = ev.target.closest('[data-fav]'), o = ev.target.closest('[data-open]');
+    if (h) {
+      const id = +h.dataset.fav, on = !h.classList.contains('on');
+      try { await api('/api/fav', {post:id, on}); h.classList.toggle('on', on); tap();
+        if (!on && cur === 'fav') { h.closest('.pcard').remove(); if (!$('g-fav').children.length) $('g-fav').innerHTML = emptyHTML(true); }
+      } catch(e){ toast('Не удалось сохранить', true); }
+    } else if (o) { tap(); openPost(+o.dataset.open); }
+  }));
+
+  /* ── промт ── */
+  async function openPost(id, confirm){
+    try {
+      const d = await api('/api/post', {post:id, confirm: !!confirm});
+      curPost = Object.assign({id}, d);
+      $('prompt').textContent = d.prompt;
+      $('tipText').innerHTML = TIPS[d.kind === 'pair' ? 'pair' : 'single'];
+      $('favBtn').classList.toggle('on', !!d.fav);
+      const box = $('tipPhoto');
+      if (d.has_photo) { $('tipImg').src = photoUrl(id); box.classList.add('on'); } else box.classList.remove('on');
+      show('detail'); return true;
+    } catch(e){
+      if (e.code === 'need_subs') { renderSubs(id, e.subs || []); show('subs'); return false; }
+      if (e.code === 'bad_init' || e.code === 'no_post') { showError(e.code); return false; }
+      toast('Не удалось открыть промт', true); return false;
     }
-    $('prompt').textContent = data.prompt;
-    $('tipText').innerHTML = TIPS[data.kind === 'pair' ? 'pair' : 'single'];
-    $('content').hidden = false;
-    clearInterval(crawl); setTarget(100);
-    if (data.has_photo && !DEMO) loadPhoto();
   }
-
-  async function loadPhoto(){
-    try {
-      const r = await fetch('/api/photo', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({initData, post: POST})});
-      if (!r.ok) return;
-      const url = URL.createObjectURL(await r.blob());
-      $('tipImg').src = url; $('tipPhoto').classList.add('on');
-    } catch(e){}
+  function renderSubs(id, subs){
+    subsPost = id;
+    $('subsList').innerHTML = subs.map((s,i) => `<button class="sub-link" data-i="${i}" type="button">
+      <span class="badge"><svg><use href="#i-${s.kind==='bot'?'bot':'chan'}"/></svg></span><span></span><svg class="arr"><use href="#i-arr"/></svg></button>`).join('');
+    $('subsList').querySelectorAll('.sub-link').forEach((b,i) => { b.children[1].textContent = subs[i].title; b.onclick = () => openLink(subs[i].link); });
   }
+  function openLink(u){
+    try { if (tg && /^https:\/\/t\.me\//.test(u) && tg.openTelegramLink) return tg.openTelegramLink(u); if (tg && tg.openLink) return tg.openLink(u); } catch(e){}
+    window.open(u, '_blank');
+  }
+  $('subsCheck').onclick = async () => { const ok = await openPost(subsPost, true); if (!ok && cur === 'subs') { haptic('error'); toast('Вы ещё не выполнили все условия', true); } };
 
-  /* ── копировать ── */
+  $('favBtn').onclick = async () => {
+    if (!curPost) return; const on = !$('favBtn').classList.contains('on');
+    try { await api('/api/fav', {post:curPost.id, on}); $('favBtn').classList.toggle('on', on); haptic('success'); toast(on ? 'Добавлено в избранное' : 'Убрано из избранного'); }
+    catch(e){ toast('Не удалось сохранить', true); }
+  };
+
   async function copyText(text){
     try { await navigator.clipboard.writeText(text); return true; } catch(e){}
-    try {
-      const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
-      document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
-    } catch(e){ return false; }
+    try { const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok; } catch(e){ return false; }
+  }
+  function flashCopied(btn, label){
+    const u = btn.querySelector('use'), sp = btn.querySelector('span'); btn.classList.add('done'); u.setAttribute('href','#i-check'); sp.textContent = 'Скопировано';
+    setTimeout(()=>{ btn.classList.remove('done'); u.setAttribute('href','#i-copy'); sp.textContent = label; }, 2200);
   }
   $('copy').onclick = async () => {
-    const ok = await copyText($('prompt').textContent);
-    if (ok) {
-      haptic('success'); toast('Промт скопирован');
-      const b = $('copy'); b.classList.add('done');
-      b.querySelector('use').setAttribute('href','#i-check'); $('copyText').textContent = 'Скопировано';
-      setTimeout(()=>{ b.classList.remove('done'); b.querySelector('use').setAttribute('href','#i-copy'); $('copyText').textContent = 'Копировать'; }, 2200);
-    } else { haptic('error'); toast('Не удалось скопировать', true); }
+    if (await copyText($('prompt').textContent)) { haptic('success'); toast('Промт скопирован'); flashCopied($('copy'), 'Копировать'); }
+    else { haptic('error'); toast('Не удалось скопировать', true); }
   };
+  document.querySelectorAll('[data-num]').forEach(b => b.onclick = async () => {
+    if (await copyText(b.dataset.num)) { haptic('success'); toast('Номер скопирован'); flashCopied(b, 'Копировать'); } else toast('Не удалось скопировать', true);
+  });
 
-  /* ── скачать: бот пришлёт промт файлом в чат ── */
   let busy = false;
   $('dl').onclick = async () => {
-    if (busy) return; busy = true;
-    const b = $('dl'), ico = b.querySelector('svg');
-    b.disabled = true; ico.outerHTML = '<span class="spin" id="sp"></span>'; $('dlText').textContent = 'Отправляю…';
-    const restore = () => {
-      const sp = $('sp'); if (sp) sp.outerHTML = '<svg><use href="#i-dl"/></svg>';
-      $('dlText').textContent = 'Скачать промт'; b.disabled = false; busy = false;
-    };
-    try {
-      if (DEMO) await new Promise(r => setTimeout(r, 900)); else await api('/api/download');
-      haptic('success'); toast('Промт отправлен в чат с ботом');
-    } catch(e){ haptic('error'); toast('Не удалось отправить. Попробуйте ещё раз', true); }
-    setTimeout(restore, 600);
+    if (busy || !curPost) return; busy = true;
+    const b = $('dl'); b.disabled = true; b.querySelector('svg').outerHTML = '<span class="spin" id="sp"></span>'; $('dlText').textContent = 'Отправляю…';
+    try { await api('/api/download', {post:curPost.id}); haptic('success'); toast('Промт отправлен в чат с ботом'); }
+    catch(e){ haptic('error'); toast('Не удалось отправить. Попробуйте ещё раз', true); }
+    setTimeout(()=>{ const sp = $('sp'); if (sp) sp.outerHTML = '<svg><use href="#i-dl"/></svg>'; $('dlText').textContent = 'Скачать промт'; b.disabled = false; busy = false; }, 600);
   };
 
+  /* ── профиль ── */
+  async function renderProfile(){
+    const name = [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || 'Пользователь';
+    $('meName').textContent = name; $('meUser').textContent = tgUser.username ? '@' + tgUser.username : '';
+    const ava = $('ava');
+    if (tgUser.photo_url) { ava.innerHTML = ''; const im = new Image(); im.alt = ''; im.src = tgUser.photo_url;
+      im.onerror = () => { ava.textContent = name[0].toUpperCase(); }; ava.appendChild(im); }
+    else ava.textContent = name[0].toUpperCase();
+    try { me = await api('/api/profile'); $('stInv').textContent = me.invited; $('stGot').textContent = me.got; } catch(e){}
+  }
+  $('shareBtn').onclick = () => {
+    if (!me) return toast('Подождите секунду…');
+    const url = 'https://t.me/share/url?url=' + encodeURIComponent(me.link) + '&text=' + encodeURIComponent('Готовые промты для ChatGPT ✨ Заходи — это бесплатно!');
+    openLink(url);
+  };
+  $('thanksBtn').onclick = () => { tap(); show('thanks'); };
+  $('owner').onclick = e => { e.preventDefault(); openLink('https://t.me/IDIEVW'); };
   $('retry').onclick = () => location.reload();
-  $('owner').onclick = e => { if (tg && tg.openTelegramLink) { e.preventDefault(); tg.openTelegramLink('https://t.me/IDIEVW'); } };
 
-  load();
+  /* ── старт ── */
+  (async function init(){
+    try {
+      me = await api('/api/profile');                 // здесь же происходит регистрация и привязка к профилю Telegram
+    } catch(e){ finishSplash(); splashDone = () => showError(e.code); return; }
+    if (START_POST) { prevView = 'posts'; await openPost(START_POST); if (!cur) show('posts'); }
+    else show('posts');
+    finishSplash();
+  })();
 })();
 </script>
 </body>
