@@ -59,6 +59,7 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     MenuButtonCommands,
+    MenuButtonWebApp,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -200,6 +201,12 @@ def init_db() -> None:
                 receipt_kind TEXT,
                 status TEXT DEFAULT 'pending',
                 created INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS favorites(
+                user_id INTEGER,
+                post_id INTEGER,
+                ts INTEGER,
+                PRIMARY KEY(user_id, post_id)
             );
             CREATE TABLE IF NOT EXISTS settings(
                 key TEXT PRIMARY KEY,
@@ -738,6 +745,7 @@ async def process(bot: Bot, user_id: int, post_id: int, bots_confirmed: bool = F
         c.execute("INSERT INTO claims(user_id, post_id, ts) VALUES(?,?,?)", (user_id, post_id, int(time.time())))
     if WEBAPP_URL:
         await announce_ready(bot, user_id, post_id)  # промт откроется в мини-приложении
+        await send_saver_promo(bot, user_id)  # реклама — сразу после «промт готов» (после скачивания её нет)
     else:
         await send_prompt(bot, user_id, post_id, post["prompt"])
         await send_tip(bot, user_id, post)
@@ -1041,8 +1049,9 @@ def ico(normal: str) -> str:
 
 def main_kb() -> ReplyKeyboardMarkup:
     """Постоянные кнопки внизу чата (не пропадают)."""
+    app_row = [[KeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=f"{WEBAPP_URL}/app"))]] if WEBAPP_URL else []
     return ReplyKeyboardMarkup(
-        keyboard=[
+        keyboard=app_row + [
             [KeyboardButton(text=BTN_CREATE)],
             [KeyboardButton(text=BTN_SHARE), KeyboardButton(text=BTN_BUY)],
             [KeyboardButton(text=BTN_BAL)],
@@ -1087,7 +1096,17 @@ def promo_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/tajpromt")
+
+
 def menu_text(uid: int) -> str:
+    if FEATURES_LOCKED:  # пока функции закрыты — приглашаем в канал и в приложение
+        return (
+            "👋 Привет!\n\n"
+            f'Заходи в канал <a href="{CHANNEL_URL}">{CHANNEL_URL.replace("https://", "")}</a>, выбирай фото, '
+            "нажми на кнопку и получи промт.\n\n"
+            "Или открой приложение 👇"
+        )
     free, paid = balance(uid)
     return (
         "👋 Привет!\n\nЯ создам <b>точный промт</b> по любой картинке. Отправьте этот промт в ChatGPT вместе со "
@@ -2189,34 +2208,40 @@ _photo_cache: dict[str, bytes] = {}
 _dl_last: dict[int, float] = {}
 
 
-async def _wa_context(request):
-    """Общая проверка запроса мини-приложения: (user, post, ошибка-ответ)."""
+async def _wa_auth(request):
+    """Проверка запроса мини-приложения. Возвращает (user, body, ошибка-ответ); пользователь сразу регистрируется."""
     from aiohttp import web
 
     try:
         body = await request.json()
     except Exception:
-        return None, None, web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        return None, {}, web.json_response({"ok": False, "error": "bad_request"}, status=400)
     user = check_init_data(str(body.get("initData", "")))
     if not user:
-        return None, None, web.json_response({"ok": False, "error": "bad_init"}, status=401)
+        return None, body, web.json_response({"ok": False, "error": "bad_init"}, status=401)
     webapp_register(user)
+    return user, body, None
+
+
+def _wa_post(body):
     try:
-        post_id = int(body.get("post", 0))
+        pid = int(body.get("post", 0))
     except (TypeError, ValueError):
-        post_id = 0
+        pid = 0
     with db() as c:
-        post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
-        if not post:
-            return None, None, web.json_response({"ok": False, "error": "no_post"}, status=404)
-        # промт отдаём только тем, кто прошёл проверку подписок (запись в claims появляется после неё)
-        if not c.execute("SELECT 1 FROM claims WHERE user_id=? AND post_id=?", (user["id"], post_id)).fetchone():
-            return None, None, web.json_response({"ok": False, "error": "no_claim"}, status=403)
-    return user, post, None
+        return c.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
+
+
+def _has_claim(uid: int, pid: int) -> bool:
+    with db() as c:
+        return bool(c.execute("SELECT 1 FROM claims WHERE user_id=? AND post_id=?", (uid, pid)).fetchone())
 
 
 def make_web_app(bot: Bot):
     from aiohttp import web
+
+    def jerr(code: str, status: int):
+        return web.json_response({"ok": False, "error": code}, status=status)
 
     async def page(request):
         try:
@@ -2225,32 +2250,103 @@ def make_web_app(bot: Bot):
         except OSError:
             return web.Response(text="webapp.html не найден рядом с bot.py", status=500)
 
-    async def api_open(request):
-        user, post, err = await _wa_context(request)
-        if err:
-            return err
-        return web.json_response({"ok": True, "kind": post["kind"] or "single", "prompt": post["prompt"],
-                                  "has_photo": bool(post["photo"])})
-
-    async def api_photo(request):
-        user, post, err = await _wa_context(request)
-        if err:
-            return err
-        fid = post["photo"]
-        if not fid:
-            return web.Response(status=404)
-        if fid not in _photo_cache:
-            buf = await bot.download(fid)
-            if len(_photo_cache) > 40:
-                _photo_cache.clear()
-            _photo_cache[fid] = buf.getvalue()
-        return web.Response(body=_photo_cache[fid], content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
-
-    async def api_download(request):
-        user, post, err = await _wa_context(request)
+    async def api_profile(request):
+        user, body, err = await _wa_auth(request)
         if err:
             return err
         uid = user["id"]
+        with db() as c:
+            invited = c.execute("SELECT COUNT(*) FROM users WHERE ref_by=?", (uid,)).fetchone()[0]
+            got = c.execute("SELECT COUNT(DISTINCT post_id) FROM claims WHERE user_id=?", (uid,)).fetchone()[0]
+        return web.json_response({"ok": True, "invited": invited, "got": got,
+                                  "link": f"https://t.me/{BOT_USERNAME}?start=ref{uid}"})
+
+    async def api_list(request):
+        user, body, err = await _wa_auth(request)
+        if err:
+            return err
+        only_fav = bool(body.get("fav"))
+        sql = ("SELECT p.id, p.kind, p.created, (p.photo IS NOT NULL AND p.photo != '') AS hp, "
+               "EXISTS(SELECT 1 FROM favorites f WHERE f.user_id=? AND f.post_id=p.id) AS fav FROM posts p ")
+        if only_fav:
+            sql += "WHERE EXISTS(SELECT 1 FROM favorites f WHERE f.user_id=? AND f.post_id=p.id) "
+        sql += "ORDER BY p.id DESC LIMIT 60"
+        with db() as c:
+            rows = c.execute(sql, (user["id"], user["id"]) if only_fav else (user["id"],)).fetchall()
+        items = [{"id": r["id"], "kind": r["kind"] or "single", "created": r["created"] or 0,
+                  "has_photo": bool(r["hp"]), "fav": bool(r["fav"])} for r in rows]
+        return web.json_response({"ok": True, "items": items})
+
+    async def api_post(request):
+        """Открыть промт: сразу, если уже получен; иначе проверяем подписки этой публикации."""
+        user, body, err = await _wa_auth(request)
+        if err:
+            return err
+        post = _wa_post(body)
+        if not post:
+            return jerr("no_post", 404)
+        uid, pid = user["id"], post["id"]
+        if not _has_claim(uid, pid):
+            missing = await missing_channels(bot, uid, pid)
+            not_started, manual = await check_bots(bot, uid, pid)
+            need = missing + not_started + ([] if body.get("confirm") else manual)
+            if need:
+                return web.json_response({"ok": False, "error": "need_subs", "subs": [
+                    {"title": x["title"], "link": x["link"], "kind": x["kind"]} for x in need]}, status=403)
+            with db() as c:
+                c.execute("INSERT INTO claims(user_id, post_id, ts) VALUES(?,?,?)", (uid, pid, int(time.time())))
+        with db() as c:
+            fav = bool(c.execute("SELECT 1 FROM favorites WHERE user_id=? AND post_id=?", (uid, pid)).fetchone())
+        return web.json_response({"ok": True, "kind": post["kind"] or "single", "prompt": post["prompt"],
+                                  "has_photo": bool(post["photo"]), "fav": fav})
+
+    async def api_fav(request):
+        user, body, err = await _wa_auth(request)
+        if err:
+            return err
+        post = _wa_post(body)
+        if not post:
+            return jerr("no_post", 404)
+        on = bool(body.get("on"))
+        with db() as c:
+            if on:
+                c.execute("INSERT OR IGNORE INTO favorites(user_id, post_id, ts) VALUES(?,?,?)",
+                          (user["id"], post["id"], int(time.time())))
+            else:
+                c.execute("DELETE FROM favorites WHERE user_id=? AND post_id=?", (user["id"], post["id"]))
+        return web.json_response({"ok": True, "fav": on})
+
+    async def api_photo(request):
+        # GET: фото публикации (оно и так публичное в канале), но только для запросов из мини-приложения
+        if not check_init_data(request.query.get("d", "")):
+            return web.Response(status=401)
+        try:
+            pid = int(request.query.get("post", "0"))
+        except ValueError:
+            return web.Response(status=404)
+        with db() as c:
+            row = c.execute("SELECT photo FROM posts WHERE id=?", (pid,)).fetchone()
+        if not row or not row["photo"]:
+            return web.Response(status=404)
+        fid = row["photo"]
+        if fid not in _photo_cache:
+            buf = await bot.download(fid)
+            if len(_photo_cache) > 120:
+                _photo_cache.clear()
+            _photo_cache[fid] = buf.getvalue()
+        return web.Response(body=_photo_cache[fid], content_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=86400"})
+
+    async def api_download(request):
+        user, body, err = await _wa_auth(request)
+        if err:
+            return err
+        post = _wa_post(body)
+        if not post:
+            return jerr("no_post", 404)
+        uid = user["id"]
+        if not _has_claim(uid, post["id"]):
+            return jerr("no_claim", 403)
         if time.time() - _dl_last.get(uid, 0) < 4:
             return web.json_response({"ok": True})  # защита от двойного нажатия
         _dl_last[uid] = time.time()
@@ -2260,18 +2356,21 @@ def make_web_app(bot: Bot):
                 BufferedInputFile(post["prompt"].encode("utf-8-sig"), filename=f"prompt_{post['id']}.txt"),
                 caption=f"Ваш промт 💛\nОткройте файл и скопируйте текст.\n\n{SIGN}",
             )
-            await send_saver_promo(bot, uid)
         except Exception as e:
             log.warning("отправка промта из мини-приложения: %s", e)
-            return web.json_response({"ok": False, "error": "send_failed"}, status=500)
+            return jerr("send_failed", 500)
         return web.json_response({"ok": True})
 
     app = web.Application()
     app.router.add_get("/", page)
     app.router.add_get("/app", page)
     app.router.add_get("/health", lambda r: web.Response(text="ok"))
-    app.router.add_post("/api/open", api_open)
-    app.router.add_post("/api/photo", api_photo)
+    app.router.add_get("/api/photo", api_photo)
+    app.router.add_post("/api/profile", api_profile)
+    app.router.add_post("/api/list", api_list)
+    app.router.add_post("/api/post", api_post)
+    app.router.add_post("/api/open", api_post)  # старое имя
+    app.router.add_post("/api/fav", api_fav)
     app.router.add_post("/api/download", api_download)
     return app
 
@@ -2293,7 +2392,11 @@ async def setup_commands(bot: Bot) -> None:
                 await bot.set_my_commands(admins, scope=BotCommandScopeChat(chat_id=aid))
             except Exception as e:
                 log.warning("команды для админа %s: %s", aid, e)
-        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        if WEBAPP_URL:  # вместо списка команд — кнопка, открывающая мини-приложение
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="Приложение", web_app=WebAppInfo(url=f"{WEBAPP_URL}/app")))
+        else:
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     except Exception as e:
         log.warning("не удалось установить команды меню: %s", e)
 
