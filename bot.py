@@ -2395,11 +2395,14 @@ PUB_PLANS = {
     "pro": {"name": "PRO", "icon": "👑", "price": 59, "channels": 5, "daily": None},
 }
 PUB_MAX_BUTTONS = 8
+PUB_CUSTOM_BOT_PLANS = {"pro"}  # на каких тарифах можно подключить свой бот
+PUB_REF_BONUS = int(os.getenv("PUB_REF_BONUS", "2"))  # сколько публикаций получает пригласивший за каждого друга
 PUB_BTN_NEW = "📝 Новая публикация"
 PUB_BTN_EDIT = "✏️ Редактировать публикации"
 PUB_BTN_PROFILE = "👤 Мой профиль"
 PUB_BTN_PLANS = "💎 Подписки"
-PUB_MENU_TEXTS = {PUB_BTN_NEW, PUB_BTN_EDIT, PUB_BTN_PROFILE, PUB_BTN_PLANS}
+PUB_BTN_INVITE = "🎁 Пригласить друга"
+PUB_MENU_TEXTS = {PUB_BTN_NEW, PUB_BTN_EDIT, PUB_BTN_PROFILE, PUB_BTN_PLANS, PUB_BTN_INVITE}
 PUB_ACTIONS = {  # действия кнопки под постом
     "file": "📁 Отправить файл (фото, видео, музыка...)",
     "link": "🔗 Открыть ссылку",
@@ -2419,6 +2422,7 @@ pub_router = Router()
 PUB_ADMIN = F.from_user.id.in_(PUB_ADMIN_IDS)
 _pub_username = ""
 _pub_pay_msgs: dict[int, list] = {}
+_custom: dict[int, dict] = {}  # запущенные личные боты пользователей: id -> {bot, task, owner, username}
 
 
 class PubNew(StatesGroup):
@@ -2429,6 +2433,9 @@ class PubNew(StatesGroup):
     btn_action = State()
     btn_value = State()
     btn_color = State()
+    btn_cond = State()
+    btn_need = State()
+    btn_layout = State()
 
 
 class PubChan(StatesGroup):
@@ -2445,6 +2452,14 @@ class PubReject(StatesGroup):
 
 class PubEdit(StatesGroup):
     caption = State()
+
+
+class PubBot(StatesGroup):
+    token = State()
+
+
+class PubError(Exception):
+    pass
 
 
 # ── база ──
@@ -2470,10 +2485,15 @@ def pub_init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS pub_buttons(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER, label TEXT, action TEXT,
-                payload TEXT, file_kind TEXT, extra TEXT, clicks INTEGER DEFAULT 0, style TEXT
+                payload TEXT, file_kind TEXT, extra TEXT, clicks INTEGER DEFAULT 0, style TEXT,
+                same_row INTEGER DEFAULT 0, need_chat INTEGER, need_title TEXT, need_link TEXT
             );
             CREATE TABLE IF NOT EXISTS pub_likes(
                 button_id INTEGER, user_id INTEGER, PRIMARY KEY(button_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS pub_bots(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER UNIQUE, token TEXT,
+                username TEXT, tg_id INTEGER UNIQUE, status TEXT DEFAULT 'active', created INTEGER
             );
             CREATE TABLE IF NOT EXISTS pub_payments(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, plan TEXT,
@@ -2482,8 +2502,16 @@ def pub_init_db() -> None:
             );
             """
         )
-        if "style" not in [r[1] for r in c.execute("PRAGMA table_info(pub_buttons)")]:
-            c.execute("ALTER TABLE pub_buttons ADD COLUMN style TEXT")  # цвет кнопки (для старых баз)
+        have = [r[1] for r in c.execute("PRAGMA table_info(pub_buttons)")]
+        for name, ddl in (("style", "TEXT"), ("same_row", "INTEGER DEFAULT 0"), ("need_chat", "INTEGER"),
+                          ("need_title", "TEXT"), ("need_link", "TEXT")):  # для старых баз
+            if name not in have:
+                c.execute(f"ALTER TABLE pub_buttons ADD COLUMN {name} {ddl}")
+        for tbl, name, ddl in (("pub_users", "ref_by", "INTEGER"), ("pub_users", "bonus_posts", "INTEGER DEFAULT 0"),
+                               ("pub_users", "ref_count", "INTEGER DEFAULT 0"),
+                               ("pub_channels", "bot_id", "INTEGER DEFAULT 0"), ("pub_posts", "bot_id", "INTEGER DEFAULT 0")):
+            if name not in [r[1] for r in c.execute(f"PRAGMA table_info({tbl})")]:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {name} {ddl}")
 
 
 def pub_user(u) -> None:
@@ -2529,14 +2557,39 @@ def pub_today_count(uid: int) -> int:
         return c.execute("SELECT COUNT(*) FROM pub_posts WHERE owner_id=? AND created>=?", (uid, start)).fetchone()[0]
 
 
+def pub_bonus(uid: int) -> int:
+    with db() as c:
+        r = c.execute("SELECT bonus_posts FROM pub_users WHERE user_id=?", (uid,)).fetchone()
+    return (r["bonus_posts"] or 0) if r else 0
+
+
+def pub_daily_blocked(uid: int) -> bool:
+    """Дневной лимит исчерпан и бонусных публикаций нет."""
+    plan = PUB_PLANS[pub_plan_key(uid)]
+    return plan["daily"] is not None and pub_today_count(uid) >= plan["daily"] and pub_bonus(uid) <= 0
+
+
+def pub_take_bonus(uid: int) -> bool:
+    """Если дневной лимит уже исчерпан — тратит одну бонусную публикацию (True)."""
+    plan = PUB_PLANS[pub_plan_key(uid)]
+    if plan["daily"] is not None and pub_today_count(uid) >= plan["daily"]:
+        with db() as c:
+            return bool(c.execute("UPDATE pub_users SET bonus_posts=bonus_posts-1 WHERE user_id=? AND bonus_posts>0",
+                                  (uid,)).rowcount)
+    return False
+
+
 def pub_limit_error(uid: int, chat_id: int) -> str:
     """Пустая строка — можно публиковать; иначе короткий текст причины."""
-    plan = PUB_PLANS[pub_plan_key(uid)]
-    usable = [r["chat_id"] for r in pub_channels(uid)[:plan["channels"]]]
-    if chat_id not in usable:
+    key = pub_plan_key(uid)
+    plan = PUB_PLANS[key]
+    ch = next((r for r in pub_channels(uid)[:plan["channels"]] if r["chat_id"] == chat_id), None)
+    if ch is None:
         return f"Этот канал недоступен на тарифе {plan['name']}."
-    if plan["daily"] is not None and pub_today_count(uid) >= plan["daily"]:
-        return f"Лимит публикаций на сегодня исчерпан ({plan['daily']}) на тарифе {plan['name']}."
+    if ch["bot_id"] and key not in PUB_CUSTOM_BOT_PLANS:
+        return "Публикации через свой бот — только на тарифе PRO."
+    if pub_daily_blocked(uid):
+        return f"Лимит на сегодня исчерпан ({plan['daily']}). Пригласите друга — +{PUB_REF_BONUS} публикации."
     return ""
 
 
@@ -2554,22 +2607,59 @@ def pub_main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=PUB_BTN_NEW)],
                   [KeyboardButton(text=PUB_BTN_EDIT)],
-                  [KeyboardButton(text=PUB_BTN_PROFILE), KeyboardButton(text=PUB_BTN_PLANS)]],
+                  [KeyboardButton(text=PUB_BTN_PROFILE), KeyboardButton(text=PUB_BTN_PLANS)],
+                  [KeyboardButton(text=PUB_BTN_INVITE)]],
         resize_keyboard=True, is_persistent=True)
 
 
-def pub_build_markup(items: list[dict]):
-    rows = []
+def pub_group_rows(items: list[dict]) -> list[list[dict]]:
+    """Раскладка по рядам: кнопка с same_row идёт рядом с предыдущей (максимум 2 в ряду)."""
+    rows: list[list[dict]] = []
     for b in items:
-        label = b["label"]
-        if b["action"] == "link":
-            rows.append([InlineKeyboardButton(text=label, url=b["payload"], style=b.get("style") or None)])
-            continue
-        if b["action"] == "like" and b.get("likes"):
-            label = f"{label} {b['likes']}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"pb:{b['id']}" if b.get("id") else "pv",
-                                          style=b.get("style") or None)])
+        if b.get("same_row") and rows and len(rows[-1]) < 2:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    return rows
+
+
+def pub_make_btn(b: dict) -> InlineKeyboardButton:
+    label = b["label"]
+    if b["action"] == "link":
+        return InlineKeyboardButton(text=label, url=b["payload"], style=b.get("style") or None)
+    if b["action"] == "like" and b.get("likes"):
+        label = f"{label} {b['likes']}"
+    return InlineKeyboardButton(text=label, callback_data=f"pb:{b['id']}" if b.get("id") else "pv",
+                                style=b.get("style") or None)
+
+
+def pub_build_markup(items: list[dict]):
+    rows = [[pub_make_btn(b) for b in row] for row in pub_group_rows(items)]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def pub_insert_button(c, pid: int, b: dict) -> None:
+    c.execute(
+        "INSERT INTO pub_buttons(post_id, label, action, payload, file_kind, extra, style, same_row, need_chat, need_title, need_link) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, b["label"], b["action"], b["payload"], b.get("file_kind"), b.get("extra"), b.get("style"),
+         b.get("same_row") or 0, b.get("need_chat"), b.get("need_title"), b.get("need_link")))
+
+
+async def pub_check_sub(bot: Bot, uid: int, b: dict):
+    """Проверка подписки для кнопки. Возвращает (можно_ли, текст_для_всплывающего_окна)."""
+    if not b.get("need_chat"):
+        return True, ""
+    try:
+        mem = await bot.get_chat_member(b["need_chat"], uid)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False, "Не удалось проверить подписку. Попробуйте позже."
+    ok = mem.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR) or (
+        mem.status == ChatMemberStatus.RESTRICTED and getattr(mem, "is_member", False))
+    if ok:
+        return True, ""
+    link = f" {b['need_link']}" if b.get("need_link") else ""
+    return False, f"🔒 Сначала подпишитесь на «{(b.get('need_title') or 'канал')[:60]}»{link}, затем нажмите кнопку ещё раз."[:200]
 
 
 def pub_media(m: Message):
@@ -2626,7 +2716,7 @@ def pub_plans_text(uid: int) -> str:
     for key, p in PUB_PLANS.items():
         price = "бесплатно" if not p["price"] else f"{p['price']} сомони / месяц"
         daily = "безлимитные публикации" if p["daily"] is None else f"{p['daily']} публ. в день"
-        colors = "\n   🎨 цвета кнопок" if key != "free" else ""
+        colors = ("\n   🎨 цвета кнопок" if key != "free" else "") + ("\n   🤖 свой бот для файлов" if key == "pro" else "")
         lines.append(f"{p['icon']} <b>{p['name']}</b> — {price}\n   до {p['channels']} кан. • {daily}{colors}")
     until = pub_plan_until(uid)
     now = PUB_PLANS[cur]["name"] + (f" (до {pub_date(until)})" if cur != "free" and until else "")
@@ -2647,6 +2737,13 @@ def pub_add_channel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить канал", callback_data="pc:add")]])
 
 
+async def pub_ack(cb: CallbackQuery, *a, **k) -> None:
+    try:
+        await cb.answer(*a, **k)
+    except TelegramBadRequest:
+        pass
+
+
 async def pub_safe_delete(bot: Bot, chat_id: int, mid: int) -> None:
     try:
         await bot.delete_message(chat_id, mid)
@@ -2659,14 +2756,14 @@ async def pub_safe_delete(bot: Bot, chat_id: int, mid: int) -> None:
 @pub_router.message(CommandStart())
 async def pub_start(m: Message, command: CommandObject, state: FSMContext, bot: Bot):
     await state.clear()
+    with db() as c:
+        is_new = not c.execute("SELECT 1 FROM pub_users WHERE user_id=?", (m.from_user.id,)).fetchone()
     pub_user(m.from_user)
     arg = (command.args or "").strip()
-    if arg.startswith("b") and arg[1:].isdigit():  # пользователь нажал кнопку в канале, но бот ещё не был запущен
-        with db() as c:
-            row = c.execute("SELECT * FROM pub_buttons WHERE id=?", (int(arg[1:]),)).fetchone()
-        if row and row["action"] in ("file", "text"):
-            if await pub_deliver(bot, m.from_user.id, dict(row)):
-                return
+    if arg.startswith("r") and arg[1:].isdigit() and is_new:  # пришёл по ссылке друга
+        await pub_register_ref(bot, m.from_user.id, int(arg[1:]))
+    if await pub_deep_deliver(m, bot, arg):  # пользователь нажал кнопку в канале, но бот ещё не был запущен
+        return
     await m.answer(
         "👋 <b>Публикации в ваших каналах</b>\n\n"
         "1️⃣ Добавьте свой канал\n2️⃣ Создайте пост с фото, видео или музыкой\n"
@@ -2695,12 +2792,21 @@ async def pub_profile(m: Message, state: FSMContext):
     text = (f"👤 <b>Мой профиль</b>\n\nID: <code>{uid}</code>\n"
             f"Тариф: {plan['icon']} <b>{plan['name']}</b>"
             + (f" — до {pub_date(until)}" if key != "free" and until else "") + "\n"
-            f"Каналы: {len(chans)}/{plan['channels']}\nПубликации сегодня: {daily}\n")
+            f"Каналы: {len(chans)}/{plan['channels']}\nПубликации сегодня: {daily}\n"
+            f"🎁 Бонусные публикации: {pub_bonus(uid)}\n")
     kb = InlineKeyboardBuilder()
     for ch in chans:
-        text += f"\n📢 {html.escape(ch['title'] or str(ch['chat_id']))}"
+        text += f"\n{'🤖' if ch['bot_id'] else '📢'} {html.escape(ch['title'] or str(ch['chat_id']))}"
         kb.button(text=f"🗑 Убрать: {(ch['title'] or '')[:25]}", callback_data=f"pc:del:{ch['id']}")
     kb.button(text="➕ Добавить канал", callback_data="pc:add")
+    crow = pub_custom_row(uid)
+    if crow:
+        text += f"\n\n🤖 Свой бот: @{html.escape(crow['username'] or '')}"
+        kb.button(text="🔄 Перевести каналы на свой бот", callback_data="cbot:move")
+        kb.button(text="❌ Отключить свой бот", callback_data="cbot:off")
+    else:
+        kb.button(text="🤖 Подключить свой бот (PRO)", callback_data="cbot:add")
+    kb.button(text="🎁 Пригласить друга", callback_data="ref:open")
     kb.button(text="💎 Тарифы", callback_data="pl:open")
     kb.adjust(1)
     await m.answer(text, reply_markup=kb.as_markup())
@@ -2720,6 +2826,348 @@ async def pub_plans_cb(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+# ── пригласить друга (бонусные публикации) ──
+
+def pub_limit_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"🎁 Пригласить друга (+{PUB_REF_BONUS} публикации)", callback_data="ref:open")
+    for key in ("standard", "pro"):
+        p = PUB_PLANS[key]
+        kb.button(text=f"{p['icon']} Подключить {p['name']} — {p['price']} сом.", callback_data=f"pp:{key}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def pub_register_ref(bot: Bot, new_uid: int, inviter: int) -> None:
+    """Новый пользователь пришёл по ссылке друга: пригласившему +PUB_REF_BONUS публикаций (один раз за человека)."""
+    if inviter == new_uid:
+        return
+    with db() as c:
+        if not c.execute("SELECT 1 FROM pub_users WHERE user_id=?", (inviter,)).fetchone():
+            return
+        done = c.execute("UPDATE pub_users SET ref_by=? WHERE user_id=? AND ref_by IS NULL", (inviter, new_uid)).rowcount
+        if not done:
+            return
+        c.execute("UPDATE pub_users SET bonus_posts=COALESCE(bonus_posts,0)+?, ref_count=COALESCE(ref_count,0)+1 WHERE user_id=?",
+                  (PUB_REF_BONUS, inviter))
+    try:
+        await bot.send_message(inviter, f"🎉 По вашей ссылке пришёл новый пользователь!\n"
+                                        f"Вам начислено <b>+{PUB_REF_BONUS}</b> бесплатных публикаций. Баланс: {pub_bonus(inviter)}")
+    except Exception:
+        pass
+
+
+async def pub_send_invite(target: Message, uid: int) -> None:
+    link = f"https://t.me/{_pub_username}?start=r{uid}"
+    with db() as c:
+        r = c.execute("SELECT ref_count FROM pub_users WHERE user_id=?", (uid,)).fetchone()
+    share = ("https://t.me/share/url?url=" + quote(link) +
+             "&text=" + quote("Публикуй посты с кнопками и файлами в своём канале 👇"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)]])
+    await target.answer(
+        f"🎁 <b>Пригласи друга — получи +{PUB_REF_BONUS} публикации</b>\n\n"
+        f"За каждого нового человека, который нажмёт «Старт» по вашей ссылке, вы получаете {PUB_REF_BONUS} бесплатных "
+        "публикации. Они тратятся, когда дневной лимит тарифа закончился.\n\n"
+        f"🔗 Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"Приглашено друзей: <b>{(r['ref_count'] or 0) if r else 0}</b>\nБонусных публикаций: <b>{pub_bonus(uid)}</b>",
+        reply_markup=kb)
+
+
+@pub_router.message(F.text == PUB_BTN_INVITE)
+async def pub_invite(m: Message, state: FSMContext):
+    await state.clear()
+    pub_user(m.from_user)
+    await pub_send_invite(m, m.from_user.id)
+
+
+@pub_router.callback_query(F.data == "ref:open")
+async def pub_invite_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pub_user(cb.from_user)
+    await pub_send_invite(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+# ── свой бот пользователя (публикации и файлы идут от его бота) ──
+
+def pub_tok_enc(t: str) -> str:
+    f = _crypto()
+    return "enc:" + f.encrypt(t.encode()).decode() if f else t
+
+
+def pub_tok_dec(v: str) -> str:
+    if v.startswith("enc:"):
+        f = _crypto()
+        if not f:
+            raise ValueError("нет DB_ENCRYPT_KEY для расшифровки токена")
+        return f.decrypt(v[4:].encode()).decode()
+    return v
+
+
+def pub_custom_row(uid: int):
+    with db() as c:
+        return c.execute("SELECT * FROM pub_bots WHERE owner_id=? AND status='active'", (uid,)).fetchone()
+
+
+def pub_user_custom(uid: int):
+    """(id личного бота, Bot) — если у пользователя он подключён, запущен и тариф позволяет; иначе (0, None)."""
+    row = pub_custom_row(uid)
+    if row and pub_plan_key(uid) in PUB_CUSTOM_BOT_PLANS and row["id"] in _custom:
+        return row["id"], _custom[row["id"]]["bot"]
+    return 0, None
+
+
+def pub_bot_by_id(main: Bot, bot_id: int):
+    """Бот, которым опубликован пост/канал: 0 — главный, иначе личный бот (или None, если не запущен)."""
+    if not bot_id:
+        return main
+    info = _custom.get(bot_id)
+    return info["bot"] if info else None
+
+
+def pub_ctx_botid(d: dict) -> int:
+    if d.get("edit_post"):
+        with db() as c:
+            r = c.execute("SELECT bot_id FROM pub_posts WHERE id=?", (d["edit_post"],)).fetchone()
+        return (r["bot_id"] or 0) if r else 0
+    return (d.get("draft") or {}).get("bot_id") or 0
+
+
+async def pub_deep_deliver(m: Message, bot: Bot, arg: str, owner_id: int | None = None) -> bool:
+    """/start b<id>: выдать содержимое кнопки (после проверки подписки). True — запрос обработан."""
+    if not (arg.startswith("b") and arg[1:].isdigit()):
+        return False
+    with db() as c:
+        row = c.execute("SELECT b.*, p.owner_id AS powner FROM pub_buttons b JOIN pub_posts p ON p.id=b.post_id "
+                        "WHERE b.id=?", (int(arg[1:]),)).fetchone()
+    if not row or row["action"] not in ("file", "text"):
+        return False
+    if owner_id is not None and row["powner"] != owner_id:
+        return False
+    ok, why = await pub_check_sub(bot, m.from_user.id, dict(row))
+    if not ok:
+        await m.answer(why)
+        return True
+    return await pub_deliver(bot, m.from_user.id, dict(row))
+
+
+async def pub_port_file(main: Bot, pbot: Bot, owner: int, kind: str, fid: str, fname) -> str:
+    """Переносит файл в личный бот (file_id у каждого бота свой). Возвращает file_id для личного бота."""
+    try:
+        data = (await main.download(fid)).getvalue()
+        ext = {"photo": "jpg", "video": "mp4", "audio": "mp3", "voice": "ogg", "animation": "mp4"}.get(kind, "bin")
+        msg = await getattr(pbot, "send_" + kind)(owner, **{kind: BufferedInputFile(data, filename=fname or f"file.{ext}")})
+    except TelegramForbiddenError:
+        raise PubError(f"Откройте своего бота @{(await pbot.me()).username}, нажмите Start и повторите.")
+    except TelegramBadRequest as e:
+        raise PubError(f"Не удалось перенести файл в ваш бот (лимит 20 МБ): {e}")
+    _, new_fid = pub_media(msg)
+    await pub_safe_delete(pbot, owner, msg.message_id)
+    return new_fid
+
+
+async def pub_prepare_custom(main: Bot, pbot: Bot, owner: int, draft: dict):
+    """Готовит пост для публикации через личный бот: медиа загружается заново, файлы кнопок переносятся."""
+    d2 = dict(draft)
+    if draft["kind"] != "text":
+        try:
+            data = (await main.download(draft["file_id"])).getvalue()
+        except TelegramBadRequest as e:
+            raise PubError(f"Файл слишком большой для личного бота (лимит 20 МБ): {e}")
+        ext = {"photo": "jpg", "video": "mp4", "audio": "mp3", "voice": "ogg", "animation": "mp4"}.get(draft["kind"], "bin")
+        d2["file_id"] = BufferedInputFile(data, filename=draft.get("fname") or f"file.{ext}")
+    btns = []
+    for b in draft["buttons"]:
+        b2 = dict(b)
+        if b["action"] == "file":
+            b2["payload"] = await pub_port_file(main, pbot, owner, b["file_kind"], b["payload"], b.get("fname"))
+        btns.append(b2)
+    return d2, btns
+
+
+def make_click_router(owner_id: int) -> Router:
+    """Обработчики личного бота: кнопки под постами и выдача файлов по /start."""
+    r = Router()
+
+    @r.callback_query(F.data.regexp(r"^pb:\d+$"))
+    async def _click(cb: CallbackQuery, bot: Bot):
+        await pub_handle_click(cb, bot, (await bot.me()).username, owner_id)
+
+    @r.callback_query(F.data == "pv")
+    async def _pv(cb: CallbackQuery):
+        await cb.answer()
+
+    @r.message(CommandStart())
+    async def _start(m: Message, command: CommandObject, bot: Bot):
+        if await pub_deep_deliver(m, bot, (command.args or "").strip(), owner_id):
+            return
+        await m.answer("👋 Здесь вы получаете файлы и материалы из постов канала.\n"
+                       "Нажмите кнопку «Получить» под постом в канале.")
+
+    return r
+
+
+async def _pub_custom_poll(bid: int, cbot: Bot, dp: Dispatcher) -> None:
+    try:
+        await dp.start_polling(cbot, handle_signals=False, allowed_updates=["message", "callback_query"])
+    except TelegramUnauthorizedError:
+        log.warning("личный бот #%s: токен больше не действует", bid)
+        with db() as c:
+            c.execute("UPDATE pub_bots SET status='bad' WHERE id=?", (bid,))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("личный бот #%s остановился", bid)
+    finally:
+        try:
+            await cbot.session.close()
+        except Exception:
+            pass
+        if (_custom.get(bid) or {}).get("bot") is cbot:
+            _custom.pop(bid, None)
+
+
+async def pub_custom_start(bid: int) -> bool:
+    if bid in _custom:
+        return True
+    with db() as c:
+        row = c.execute("SELECT * FROM pub_bots WHERE id=?", (bid,)).fetchone()
+    if not row:
+        return False
+    try:
+        cbot = Bot(pub_tok_dec(row["token"]), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        me = await cbot.get_me()
+        await cbot.delete_webhook(drop_pending_updates=False)
+    except TelegramUnauthorizedError:
+        with db() as c:
+            c.execute("UPDATE pub_bots SET status='bad' WHERE id=?", (bid,))
+        log.warning("личный бот #%s: неверный токен", bid)
+        return False
+    except Exception:
+        log.exception("личный бот #%s не запустился", bid)
+        return False
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(make_click_router(row["owner_id"]))
+    task = asyncio.create_task(_pub_custom_poll(bid, cbot, dp))
+    _custom[bid] = {"bot": cbot, "task": task, "owner": row["owner_id"], "username": me.username}
+    return True
+
+
+async def pub_custom_stop(bid: int) -> None:
+    info = _custom.pop(bid, None)
+    if info:
+        info["task"].cancel()
+        await asyncio.sleep(0)
+
+
+@pub_router.callback_query(F.data == "cbot:add")
+async def pub_cbot_add(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    if pub_plan_key(uid) not in PUB_CUSTOM_BOT_PLANS:
+        await cb.message.answer("🤖 <b>Свой бот</b> — функция тарифа <b>PRO</b>.\nФайлы и кнопки в ваших каналах "
+                                "будут работать от имени вашего бота, без упоминания нашего.", reply_markup=pub_plans_kb())
+        return await cb.answer()
+    if pub_custom_row(uid):
+        return await cb.answer("Свой бот уже подключён", show_alert=True)
+    await state.set_state(PubBot.token)
+    await cb.message.answer(
+        "🤖 <b>Подключение своего бота</b>\n\n"
+        "1️⃣ Откройте @BotFather → /newbot → создайте бота (название и аватарку лучше как у канала).\n"
+        "2️⃣ Скопируйте <b>токен</b> и отправьте его сюда. Я сразу удалю сообщение и сохраню токен в зашифрованном виде.\n\n"
+        "/cancel — отмена")
+    await cb.answer()
+
+
+@pub_router.message(PubBot.token, F.text)
+async def pub_cbot_token(m: Message, state: FSMContext, bot: Bot):
+    uid = m.from_user.id
+    tok = m.text.strip()
+    await pub_safe_delete(bot, m.chat.id, m.message_id)  # токен — секрет, не оставляем в чате
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", tok):
+        return await m.answer("Это не похоже на токен. Он выглядит так: <code>123456789:AAH...</code>. Отправьте ещё раз.")
+    if tok in (BOT_TOKEN, PUB_BOT_TOKEN):
+        return await m.answer("Нужен токен вашего нового бота, а не этого.")
+    try:
+        tmp = Bot(tok, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        me = await tmp.get_me()
+        await tmp.session.close()
+    except (TelegramUnauthorizedError, TelegramBadRequest, ValueError):
+        return await m.answer("Токен не подошёл. Проверьте его в @BotFather и отправьте ещё раз.")
+    with db() as c:
+        if c.execute("SELECT 1 FROM pub_bots WHERE tg_id=?", (me.id,)).fetchone():
+            return await m.answer("Этот бот уже подключён.")
+        bid = c.execute("INSERT INTO pub_bots(owner_id, token, username, tg_id, created) VALUES(?,?,?,?,?)",
+                        (uid, pub_tok_enc(tok), me.username, me.id, int(time.time()))).lastrowid
+    await state.clear()
+    if not await pub_custom_start(bid):
+        return await m.answer("Не удалось запустить бота. Попробуйте позже.")
+    await m.answer(
+        f"✅ Бот @{me.username} подключён!\n\n"
+        f"1️⃣ Откройте @{me.username} и нажмите <b>Start</b> (нужно один раз).\n"
+        "2️⃣ Добавьте его админом в канал (право «Публикация сообщений»).\n"
+        "3️⃣ «Мой профиль» → «🔄 Перевести каналы на свой бот».\n\n"
+        "Новые каналы теперь добавляются через ваш бот.", reply_markup=pub_main_kb())
+
+
+@pub_router.callback_query(F.data == "cbot:move")
+async def pub_cbot_move(cb: CallbackQuery, bot: Bot):
+    uid = cb.from_user.id
+    bot_id, vb = pub_user_custom(uid)
+    if not vb:
+        await cb.message.answer("Свой бот не подключён или не запущен (нужен тариф PRO).")
+        return await cb.answer()
+    ok, bad = [], []
+    for ch in pub_channels(uid):
+        if ch["bot_id"] == bot_id:
+            continue
+        try:
+            me = await vb.get_chat_member(ch["chat_id"], vb.id)
+            good = me.status == ChatMemberStatus.ADMINISTRATOR and getattr(me, "can_post_messages", False)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            good = False
+        if good:
+            with db() as c:
+                c.execute("UPDATE pub_channels SET bot_id=? WHERE id=?", (bot_id, ch["id"]))
+            ok.append(ch["title"] or str(ch["chat_id"]))
+        else:
+            bad.append(ch["title"] or str(ch["chat_id"]))
+    text = "🔄 <b>Перенос каналов</b>\n"
+    if ok:
+        text += "\n✅ Переведены:\n" + "\n".join(f"• {html.escape(t)}" for t in ok)
+    if bad:
+        text += f"\n\n⚠️ Ваш бот не админ в:\n" + "\n".join(f"• {html.escape(t)}" for t in bad) + \
+                "\nДобавьте его админом и нажмите ещё раз."
+    if not ok and not bad:
+        text += "\nВсе каналы уже работают через ваш бот."
+    await cb.message.answer(text)
+    await cb.answer()
+
+
+@pub_router.callback_query(F.data == "cbot:off")
+async def pub_cbot_off(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, отключить", callback_data="cbot:off2"),
+        InlineKeyboardButton(text="Отмена", callback_data="pn:cancel")]])
+    await cb.message.answer("⚠️ Если отключить бот, <b>кнопки в ранее опубликованных постах перестанут работать</b>, "
+                            "а каналы вернутся на наш бот (его нужно будет снова добавить админом). Отключить?",
+                            reply_markup=kb)
+    await cb.answer()
+
+
+@pub_router.callback_query(F.data == "cbot:off2")
+async def pub_cbot_off2(cb: CallbackQuery, bot: Bot):
+    uid = cb.from_user.id
+    row = pub_custom_row(uid)
+    if row:
+        await pub_custom_stop(row["id"])
+        with db() as c:
+            c.execute("DELETE FROM pub_bots WHERE id=?", (row["id"],))
+            c.execute("UPDATE pub_channels SET bot_id=0 WHERE owner_id=?", (uid,))
+    await pub_safe_delete(bot, cb.message.chat.id, cb.message.message_id)
+    await cb.message.answer("Свой бот отключён. Токен удалён из базы.")
+    await cb.answer()
+
+
 # ── каналы ──
 
 @pub_router.callback_query(F.data == "pc:add")
@@ -2731,9 +3179,11 @@ async def pub_chan_add(cb: CallbackQuery, state: FSMContext):
                                 "Подключите тариф выше 👇", reply_markup=pub_plans_kb())
         return await cb.answer()
     await state.set_state(PubChan.wait)
+    _, vb = pub_user_custom(uid)
+    who = f"вашего бота @{(await vb.me()).username}" if vb else "этого бота"
     await cb.message.answer(
         "📢 <b>Добавление канала</b>\n\n"
-        "1️⃣ Добавьте этого бота в канал как <b>администратора</b> (право «Публикация сообщений»).\n"
+        f"1️⃣ Добавьте {who} в канал как <b>администратора</b> (право «Публикация сообщений»).\n"
         "2️⃣ Перешлите сюда любой пост из канала <b>или</b> отправьте @username канала.\n\n/cancel — отмена")
     await cb.answer()
 
@@ -2741,6 +3191,8 @@ async def pub_chan_add(cb: CallbackQuery, state: FSMContext):
 @pub_router.message(PubChan.wait)
 async def pub_chan_got(m: Message, state: FSMContext, bot: Bot):
     uid = m.from_user.id
+    bot_id, vb = pub_user_custom(uid)
+    vbot = vb or bot
     origin = getattr(m, "forward_origin", None)
     ref = None
     if origin is not None and getattr(origin, "chat", None) is not None:
@@ -2753,13 +3205,13 @@ async def pub_chan_got(m: Message, state: FSMContext, bot: Bot):
     if ref is None:
         return await m.answer("Перешлите пост из канала или отправьте @username канала.")
     try:
-        chat = await bot.get_chat(ref)
+        chat = await vbot.get_chat(ref)
         if chat.type != "channel":
             return await m.answer("Это не канал. Нужен именно канал.")
-        me = await bot.get_chat_member(chat.id, bot.id)
+        me = await vbot.get_chat_member(chat.id, vbot.id)
         if me.status != ChatMemberStatus.ADMINISTRATOR or not getattr(me, "can_post_messages", False):
             return await m.answer("Бот не администратор канала или нет права публикации. Исправьте и отправьте ещё раз.")
-        who = await bot.get_chat_member(chat.id, uid)
+        who = await vbot.get_chat_member(chat.id, uid)
         if who.status not in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR):
             return await m.answer("Вы не администратор этого канала.")
     except (TelegramBadRequest, TelegramForbiddenError):
@@ -2774,8 +3226,8 @@ async def pub_chan_got(m: Message, state: FSMContext, bot: Bot):
         if n >= plan["channels"]:
             await state.clear()
             return await m.answer(f"⛔ Лимит каналов на тарифе {plan['name']}: {plan['channels']}.", reply_markup=pub_plans_kb())
-        c.execute("INSERT INTO pub_channels(owner_id, chat_id, title, username) VALUES(?,?,?,?)",
-                  (uid, chat.id, chat.title, chat.username))
+        c.execute("INSERT INTO pub_channels(owner_id, chat_id, title, username, bot_id) VALUES(?,?,?,?,?)",
+                  (uid, chat.id, chat.title, chat.username, bot_id))
     await state.clear()
     await m.answer(f"✅ Канал <b>{html.escape(chat.title or '')}</b> добавлен!\nТеперь нажмите «{PUB_BTN_NEW}».",
                    reply_markup=pub_main_kb())
@@ -2800,9 +3252,10 @@ async def pub_new(m: Message, state: FSMContext):
     if not chans:
         return await m.answer("У вас пока нет каналов. Сначала добавьте канал:", reply_markup=pub_add_channel_kb())
     plan = PUB_PLANS[pub_plan_key(uid)]
-    if plan["daily"] is not None and pub_today_count(uid) >= plan["daily"]:
+    if pub_daily_blocked(uid):
         return await m.answer(f"⛔ Лимит публикаций на сегодня исчерпан ({plan['daily']} на тарифе {plan['name']}).\n"
-                              "Подключите тариф выше или приходите завтра 👇", reply_markup=pub_plans_kb())
+                              f"Пригласите друга — получите +{PUB_REF_BONUS} публикации за каждого, "
+                              "или подключите тариф выше 👇", reply_markup=pub_limit_kb())
     kb = InlineKeyboardBuilder()
     for ch in chans[:plan["channels"]]:
         kb.button(text=f"📢 {ch['title']}", callback_data=f"pn:ch:{ch['id']}")
@@ -2823,7 +3276,8 @@ async def pub_pick_channel(cb: CallbackQuery, state: FSMContext):
         return await cb.answer(err, show_alert=True)
     await state.set_state(PubNew.content)
     await state.update_data(draft={"chat_id": ch["chat_id"], "title": ch["title"], "username": ch["username"],
-                                   "kind": "text", "file_id": "", "text": "", "buttons": []}, prev=[])
+                                   "kind": "text", "file_id": "", "text": "", "buttons": [],
+                                   "bot_id": ch["bot_id"] or 0}, prev=[])
     await cb.message.edit_text(
         f"📢 Канал: <b>{html.escape(ch['title'] or '')}</b>\n\n"
         "Отправьте <b>фото, видео, аудио, музыку, голосовое или файл</b> — подпись напишите прямо под ним.\n"
@@ -2854,7 +3308,8 @@ async def pub_content(m: Message, state: FSMContext, bot: Bot):
         return await m.answer("Слишком длинный текст. Для медиа подпись — до 1000 символов, для текста — до 4000.")
     d = await state.get_data()
     draft = d["draft"]
-    draft.update(kind=kind, file_id=fid, text=text)
+    draft.update(kind=kind, file_id=fid, text=text,
+                 fname=getattr(m.document or m.audio or m.video or m.animation, "file_name", None))
     await state.update_data(draft=draft)
     if kind != "text" and not text:
         await state.set_state(PubNew.caption)
@@ -2922,22 +3377,37 @@ async def pub_save(cb: CallbackQuery, state: FSMContext, bot: Bot):
     err = pub_limit_error(uid, draft["chat_id"])
     if err:
         return await cb.answer(err, show_alert=True)
+    bot_id = draft.get("bot_id") or 0
+    pbot = pub_bot_by_id(bot, bot_id)  # главный бот или личный бот пользователя
+    if pbot is None:
+        await cb.message.answer("❌ Ваш личный бот сейчас не запущен. Откройте «Мой профиль» → «Свой бот».")
+        return await pub_ack(cb)
+    send_draft, btns = draft, draft["buttons"]
+    if bot_id:  # файлы нужно перенести в личный бот: у каждого бота свои file_id
+        await cb.answer("⏳ Публикую через ваш бот...")
+        try:
+            send_draft, btns = await pub_prepare_custom(bot, pbot, uid, draft)
+        except PubError as e:
+            await cb.message.answer(f"❌ {html.escape(str(e))}")
+            return
+    used_bonus = pub_take_bonus(uid)
     with db() as c:
         pid = c.execute(
-            "INSERT INTO pub_posts(owner_id, chat_id, title, message_id, kind, file_id, text, created) VALUES(?,?,?,?,?,?,?,?)",
-            (uid, draft["chat_id"], draft["title"], 0, draft["kind"], draft["file_id"], draft["text"], int(time.time()))).lastrowid
-        for b in draft["buttons"]:
-            c.execute("INSERT INTO pub_buttons(post_id, label, action, payload, file_kind, extra, style) VALUES(?,?,?,?,?,?,?)",
-                      (pid, b["label"], b["action"], b["payload"], b.get("file_kind"), b.get("extra"), b.get("style")))
+            "INSERT INTO pub_posts(owner_id, chat_id, title, message_id, kind, file_id, text, created, bot_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (uid, draft["chat_id"], draft["title"], 0, draft["kind"], draft["file_id"], draft["text"], int(time.time()), bot_id)).lastrowid
+        for b in btns:
+            pub_insert_button(c, pid, b)
     try:
-        sent = await pub_send(bot, draft["chat_id"], draft, pub_build_markup(pub_post_items(pid)))
+        sent = await pub_send(pbot, draft["chat_id"], send_draft, pub_build_markup(pub_post_items(pid)))
     except (TelegramBadRequest, TelegramForbiddenError) as e:
         with db() as c:
             c.execute("DELETE FROM pub_buttons WHERE post_id=?", (pid,))
             c.execute("DELETE FROM pub_posts WHERE id=?", (pid,))
+            if used_bonus:
+                c.execute("UPDATE pub_users SET bonus_posts=bonus_posts+1 WHERE user_id=?", (uid,))
         await cb.message.answer("❌ Не удалось опубликовать: " + html.escape(str(e)) +
                                 "\nПроверьте, что бот — админ канала с правом публикации.")
-        return await cb.answer()
+        return await pub_ack(cb)
     with db() as c:
         c.execute("UPDATE pub_posts SET message_id=? WHERE id=?", (sent.message_id, pid))
     for mid in d.get("prev", []):
@@ -2945,7 +3415,7 @@ async def pub_save(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
     link = pub_post_link(draft["chat_id"], draft.get("username"), sent.message_id)
     await cb.message.answer(f"✅ <b>Опубликовано</b> в «{html.escape(draft['title'] or '')}»!\n{link}", reply_markup=pub_main_kb())
-    await cb.answer()
+    await pub_ack(cb)
 
 
 # ── кнопка под постом: название → действие → значение ──
@@ -3003,7 +3473,8 @@ async def pub_btn_value(m: Message, state: FSMContext, bot: Bot):
         kind, fid = pub_media(m)
         if not kind:
             return await m.answer("Отправьте файл, фото, видео или аудио.")
-        val = {"payload": fid, "file_kind": kind, "extra": pub_html(m)}
+        val = {"payload": fid, "file_kind": kind, "extra": pub_html(m),
+               "fname": getattr(m.document or m.audio or m.video or m.animation, "file_name", None)}
     elif action == "link":
         t = (m.text or "").strip()
         if t.startswith("@"):
@@ -3021,7 +3492,111 @@ async def pub_btn_value(m: Message, state: FSMContext, bot: Bot):
         if not m.text or len(m.text) > 200:
             return await m.answer("Отправьте текст до 200 символов.")
         val = {"payload": m.text}
+    if action in ("file", "text"):
+        await pub_ask_cond(bot, m.chat.id, state, val)
+    else:
+        await pub_ask_color(bot, m.chat.id, m.from_user.id, state, val)
+
+
+def pub_ctx(d: dict):
+    """(chat_id, название, username) канала, куда идёт пост (или где он уже опубликован)."""
+    if d.get("edit_post"):
+        with db() as c:
+            r = c.execute("SELECT chat_id, title FROM pub_posts WHERE id=?", (d["edit_post"],)).fetchone()
+            ch = c.execute("SELECT username FROM pub_channels WHERE chat_id=? LIMIT 1", (r["chat_id"],)).fetchone() if r else None
+        return (r["chat_id"], r["title"], ch["username"] if ch else None) if r else (None, None, None)
+    dr = d["draft"]
+    return dr["chat_id"], dr["title"], dr.get("username")
+
+
+async def pub_ask_cond(bot: Bot, chat_id: int, state: FSMContext, val: dict) -> None:
+    await state.update_data(btn_val=val)
+    await state.set_state(PubNew.btn_cond)
+    _, title, _ = pub_ctx(await state.get_data())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🆓 Без условий", callback_data="pcnd:none")
+    kb.button(text=f"📢 Подписка на «{(title or '')[:25]}»", callback_data="pcnd:this")
+    kb.button(text="➕ Подписка на другой канал", callback_data="pcnd:other")
+    kb.adjust(1)
+    await bot.send_message(
+        chat_id, "🔒 <b>Условие получения</b>\n\nМожно потребовать подписку на канал. Проверка идёт прямо в канале "
+                 "(всплывающим окном): подписанный получит содержимое, остальным бот подскажет, на что подписаться.",
+        reply_markup=kb.as_markup())
+
+
+@pub_router.callback_query(PubNew.btn_cond, F.data.startswith("pcnd:"))
+async def pub_cond_pick(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    mode = cb.data.split(":")[1]
+    d = await state.get_data()
+    val = d.get("btn_val") or {}
+    await pub_safe_delete(bot, cb.message.chat.id, cb.message.message_id)
+    if mode == "other":
+        await state.set_state(PubNew.btn_need)
+        await cb.message.answer("📢 Перешлите пост из нужного канала или отправьте его @username.\n"
+                                "Бот должен быть админом в этом канале, иначе не сможет проверять подписку.")
+        return await cb.answer()
+    if mode == "this":
+        chat_id, title, uname = pub_ctx(d)
+        val.update(need_chat=chat_id, need_title=title, need_link=f"https://t.me/{uname}" if uname else None)
+    await pub_ask_color(bot, cb.message.chat.id, cb.from_user.id, state, val)
+    await cb.answer()
+
+
+@pub_router.message(PubNew.btn_need)
+async def pub_need_got(m: Message, state: FSMContext, bot: Bot):
+    d0 = await state.get_data()
+    vbot = pub_bot_by_id(bot, pub_ctx_botid(d0)) or bot
+    origin = getattr(m, "forward_origin", None)
+    ref = None
+    if origin is not None and getattr(origin, "chat", None) is not None:
+        ref = origin.chat.id
+    elif getattr(m, "forward_from_chat", None):
+        ref = m.forward_from_chat.id
+    elif m.text and not m.text.startswith("/"):
+        t = m.text.strip().replace("https://t.me/", "@").replace("t.me/", "@")
+        ref = int(t) if t.lstrip("-").isdigit() else (t if t.startswith("@") else "@" + t)
+    if ref is None:
+        return await m.answer("Перешлите пост из канала или отправьте @username.")
+    try:
+        chat = await vbot.get_chat(ref)
+        if chat.type not in ("channel", "supergroup"):
+            return await m.answer("Нужен канал (или группа).")
+        me = await vbot.get_chat_member(chat.id, vbot.id)
+        if me.status != ChatMemberStatus.ADMINISTRATOR:
+            return await m.answer("Бот не админ в этом канале — сделайте его админом и отправьте ещё раз.")
+        who = await vbot.get_chat_member(chat.id, m.from_user.id)
+        if who.status not in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR):
+            return await m.answer("Вы не администратор этого канала.")
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return await m.answer("Не нашёл канал или у бота нет доступа. Добавьте бота админом и повторите.")
+    val = (await state.get_data()).get("btn_val") or {}
+    val.update(need_chat=chat.id, need_title=chat.title, need_link=f"https://t.me/{chat.username}" if chat.username else None)
     await pub_ask_color(bot, m.chat.id, m.from_user.id, state, val)
+
+
+async def pub_ask_layout(bot: Bot, chat_id: int, state: FSMContext, val: dict) -> None:
+    """Спрашивает, ставить ли кнопку рядом с предыдущей (2 в один ряд)."""
+    d = await state.get_data()
+    items = pub_post_items(d["edit_post"]) if d.get("edit_post") else d["draft"]["buttons"]
+    if not items or len(pub_group_rows(items)[-1]) >= 2:
+        val["same_row"] = 0
+        return await pub_btn_commit(bot, chat_id, state, val)
+    await state.update_data(btn_val=val)
+    await state.set_state(PubNew.btn_layout)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬇️ С новой строки", callback_data="play:new")
+    kb.button(text="↔️ Рядом с предыдущей (2 в ряд)", callback_data="play:same")
+    kb.adjust(1)
+    await bot.send_message(chat_id, "Где разместить кнопку?", reply_markup=kb.as_markup())
+
+
+@pub_router.callback_query(PubNew.btn_layout, F.data.startswith("play:"))
+async def pub_layout_pick(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    val = (await state.get_data()).get("btn_val") or {}
+    val["same_row"] = 1 if cb.data.endswith("same") else 0
+    await pub_safe_delete(bot, cb.message.chat.id, cb.message.message_id)
+    await pub_btn_commit(bot, cb.message.chat.id, state, val)
+    await cb.answer()
 
 
 async def pub_ask_color(bot: Bot, chat_id: int, uid: int, state: FSMContext, val: dict) -> None:
@@ -3052,23 +3627,34 @@ async def pub_btn_color(cb: CallbackQuery, state: FSMContext, bot: Bot):
     val = (await state.get_data()).get("btn_val") or {"payload": ""}
     val["style"] = None if color == "none" else color
     await pub_safe_delete(bot, cb.message.chat.id, cb.message.message_id)
-    await pub_btn_commit(bot, cb.message.chat.id, state, val)
+    await pub_ask_layout(bot, cb.message.chat.id, state, val)
     await cb.answer()
 
 
 async def pub_btn_commit(bot: Bot, chat_id: int, state: FSMContext, val: dict) -> None:
     d = await state.get_data()
     btn = {"label": d["btn_label"], "action": d["btn_action"], "payload": val.get("payload", ""),
-           "file_kind": val.get("file_kind"), "extra": val.get("extra"), "style": val.get("style")}
+           "file_kind": val.get("file_kind"), "extra": val.get("extra"), "style": val.get("style"),
+           "same_row": val.get("same_row", 0), "need_chat": val.get("need_chat"),
+           "need_title": val.get("need_title"), "need_link": val.get("need_link"),
+           "fname": val.get("fname")}
     edit_post = d.get("edit_post")
     if edit_post:  # кнопка добавляется к уже опубликованному посту
         with db() as c:
-            c.execute("INSERT INTO pub_buttons(post_id, label, action, payload, file_kind, extra, style) VALUES(?,?,?,?,?,?,?)",
-                      (edit_post, btn["label"], btn["action"], btn["payload"], btn["file_kind"], btn["extra"], btn["style"]))
             post = c.execute("SELECT * FROM pub_posts WHERE id=?", (edit_post,)).fetchone()
+        pbot = pub_bot_by_id(bot, post["bot_id"] or 0)
         await state.clear()
+        if pbot is None:
+            return await bot.send_message(chat_id, "❌ Личный бот этого поста сейчас не запущен.")
+        if post["bot_id"] and btn["action"] == "file":
+            try:
+                btn["payload"] = await pub_port_file(bot, pbot, post["owner_id"], btn["file_kind"], btn["payload"], val.get("fname"))
+            except PubError as e:
+                return await bot.send_message(chat_id, f"❌ {html.escape(str(e))}")
+        with db() as c:
+            pub_insert_button(c, edit_post, btn)
         try:
-            await bot.edit_message_reply_markup(chat_id=post["chat_id"], message_id=post["message_id"],
+            await pbot.edit_message_reply_markup(chat_id=post["chat_id"], message_id=post["message_id"],
                                                 reply_markup=pub_build_markup(pub_post_items(edit_post)))
         except (TelegramBadRequest, TelegramForbiddenError) as e:
             await bot.send_message(chat_id, "Кнопка сохранена, но обновить пост не удалось: " + html.escape(str(e)))
@@ -3083,6 +3669,11 @@ async def pub_btn_commit(bot: Bot, chat_id: int, state: FSMContext, val: dict) -
 
 @pub_router.callback_query(F.data.regexp(r"^pb:\d+$"))
 async def pub_button_click(cb: CallbackQuery, bot: Bot):
+    await pub_handle_click(cb, bot, _pub_username)
+
+
+async def pub_handle_click(cb: CallbackQuery, bot: Bot, username: str, owner_id: int | None = None):
+    """Нажатие кнопки под постом. Работает и в главном боте, и в личных ботах пользователей."""
     bid = int(cb.data.split(":")[1])
     with db() as c:
         row = c.execute("SELECT * FROM pub_buttons WHERE id=?", (bid,)).fetchone()
@@ -3091,6 +3682,11 @@ async def pub_button_click(cb: CallbackQuery, bot: Bot):
     if not row:
         return await cb.answer("Эта кнопка больше не активна", show_alert=True)
     b = dict(row)
+    if owner_id is not None:  # личный бот обслуживает только посты своего владельца
+        with db() as c:
+            post = c.execute("SELECT owner_id FROM pub_posts WHERE id=?", (b["post_id"],)).fetchone()
+        if not post or post["owner_id"] != owner_id:
+            return await cb.answer("Кнопка недоступна", show_alert=True)
     if b["action"] == "alert":
         return await cb.answer(b["payload"][:200], show_alert=True)
     if b["action"] == "like":
@@ -3107,10 +3703,13 @@ async def pub_button_click(cb: CallbackQuery, bot: Bot):
         except TelegramBadRequest:
             pass
         return await cb.answer(note)
+    ok, why = await pub_check_sub(bot, cb.from_user.id, b)  # проверка подписки — прямо в канале, всплывающим окном
+    if not ok:
+        return await cb.answer(why, show_alert=True)
     if await pub_deliver(bot, cb.from_user.id, b):
         return await cb.answer("✅ Отправил вам в личные сообщения")
     # бот ещё не запущен у пользователя — открываем бота, он сразу выдаст содержимое кнопки
-    await cb.answer(url=f"https://t.me/{_pub_username}?start=b{bid}")
+    await cb.answer(url=f"https://t.me/{username}?start=b{bid}")
 
 
 # ── редактирование публикаций ──
@@ -3177,6 +3776,9 @@ async def pub_edit_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
     post = pub_own_post(cb.from_user.id, pid)
     if not post:
         return await cb.answer("Публикация не найдена", show_alert=True)
+    pbot = pub_bot_by_id(bot, post["bot_id"] or 0) if act in ("clr", "del") else bot
+    if pbot is None:
+        return await cb.answer("Личный бот этого поста не запущен. Проверьте «Мой профиль» → «Свой бот».", show_alert=True)
     if act == "cap":
         await state.set_state(PubEdit.caption)
         await state.update_data(edit_post=pid)
@@ -3191,7 +3793,7 @@ async def pub_edit_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         with db() as c:
             c.execute("DELETE FROM pub_buttons WHERE post_id=?", (pid,))
         try:
-            await bot.edit_message_reply_markup(chat_id=post["chat_id"], message_id=post["message_id"], reply_markup=None)
+            await pbot.edit_message_reply_markup(chat_id=post["chat_id"], message_id=post["message_id"], reply_markup=None)
         except TelegramBadRequest:
             pass
         await cb.message.answer("🧹 Кнопки убраны.")
@@ -3206,7 +3808,7 @@ async def pub_edit_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await cb.message.answer("\n".join(lines))
     elif act == "del":
         try:
-            await bot.delete_message(post["chat_id"], post["message_id"])
+            await pbot.delete_message(post["chat_id"], post["message_id"])
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
         with db() as c:
@@ -3227,11 +3829,15 @@ async def pub_edit_caption(m: Message, state: FSMContext, bot: Bot):
     if len(text) > (4000 if post["kind"] == "text" else 1000):
         return await m.answer("Слишком длинный текст.")
     markup = pub_build_markup(pub_post_items(pid))
+    pbot = pub_bot_by_id(bot, post["bot_id"] or 0)
+    if pbot is None:
+        await state.clear()
+        return await m.answer("❌ Личный бот этого поста сейчас не запущен.")
     try:
         if post["kind"] == "text":
-            await bot.edit_message_text(text, chat_id=post["chat_id"], message_id=post["message_id"], reply_markup=markup)
+            await pbot.edit_message_text(text, chat_id=post["chat_id"], message_id=post["message_id"], reply_markup=markup)
         else:
-            await bot.edit_message_caption(chat_id=post["chat_id"], message_id=post["message_id"], caption=text, reply_markup=markup)
+            await pbot.edit_message_caption(chat_id=post["chat_id"], message_id=post["message_id"], caption=text, reply_markup=markup)
     except (TelegramBadRequest, TelegramForbiddenError) as e:
         return await m.answer("Не удалось изменить: " + html.escape(str(e)))
     with db() as c:
@@ -3425,9 +4031,17 @@ async def run_publisher(handle_signals: bool = False) -> None:
             log.warning("команды второго бота: %s", e)
         await pbot.delete_webhook(drop_pending_updates=True)
         log.info("Бот публикаций @%s запущен", _pub_username)
+        with db() as c:
+            custom_ids = [r["id"] for r in c.execute("SELECT id FROM pub_bots WHERE status='active'")]
+        for cid in custom_ids:
+            await pub_custom_start(cid)
+        if custom_ids:
+            log.info("Личных ботов пользователей запущено: %s", len(_custom))
         try:
             await dp.start_polling(pbot, handle_signals=handle_signals)
         finally:
+            for cid in list(_custom):
+                await pub_custom_stop(cid)
             await pbot.session.close()
     except TelegramUnauthorizedError:
         log.error("PUBLISH_BOT_TOKEN неверный — бот публикаций не запущен")
