@@ -2407,6 +2407,7 @@ PUB_ACTIONS = {  # действия кнопки под постом
     "file": "📁 Отправить файл (фото, видео, музыка...)",
     "link": "🔗 Открыть ссылку",
     "text": "💬 Прислать текст в личку",
+    "dm": "📩 Переслать текст в личку админу",
     "alert": "🔔 Всплывающее окно",
     "like": "👍 Лайк со счётчиком",
 }
@@ -2596,7 +2597,8 @@ def pub_limit_error(uid: int, chat_id: int) -> str:
 def pub_post_items(post_id: int) -> list[dict]:
     with db() as c:
         rows = c.execute(
-            "SELECT b.*, (SELECT COUNT(*) FROM pub_likes l WHERE l.button_id=b.id) AS likes "
+            "SELECT b.*, (SELECT COUNT(*) FROM pub_likes l WHERE l.button_id=b.id) AS likes, "
+            "(SELECT text FROM pub_posts p WHERE p.id=b.post_id) AS post_text "
             "FROM pub_buttons b WHERE b.post_id=? ORDER BY b.id", (post_id,)).fetchall()
     return [dict(r) for r in rows]
 
@@ -2623,8 +2625,23 @@ def pub_group_rows(items: list[dict]) -> list[list[dict]]:
     return rows
 
 
+def pub_dm_url(username: str, post_text: str | None) -> str:
+    """Ссылка на чат с админом: в поле ввода уже готово сообщение «хочу узнать подробнее» + текст поста."""
+    plain = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", post_text or ""))).strip()
+    base = f"https://t.me/{(username or '').lstrip('@')}?text="
+    msg = "Здравствуйте! Хочу узнать об этом подробнее."
+    for limit in (300, 200, 120, 60, 0):  # ссылка у Telegram ограничена по длине — укорачиваем текст
+        part = plain[:limit].rstrip() + ("…" if len(plain) > limit and limit else "") if limit else ""
+        url = base + quote(msg + (f"\n\n«{part}»" if part else ""))
+        if len(url) <= 1800:
+            return url
+    return base + quote(msg)
+
+
 def pub_make_btn(b: dict) -> InlineKeyboardButton:
     label = b["label"]
+    if b["action"] == "dm":
+        return InlineKeyboardButton(text=label, url=pub_dm_url(b["payload"], b.get("post_text")), style=b.get("style") or None)
     if b["action"] == "link":
         return InlineKeyboardButton(text=label, url=b["payload"], style=b.get("style") or None)
     if b["action"] == "like" and b.get("likes"):
@@ -3344,7 +3361,8 @@ async def pub_show_draft(bot: Bot, chat_id: int, state: FSMContext) -> None:
     await state.set_state(PubNew.confirm)
     prev = []
     try:
-        s = await pub_send(bot, chat_id, draft, pub_build_markup(draft["buttons"]))
+        s = await pub_send(bot, chat_id, draft,
+                           pub_build_markup([dict(b, post_text=draft["text"]) for b in draft["buttons"]]))
         prev.append(s.message_id)
     except (TelegramBadRequest, TelegramForbiddenError) as e:
         await bot.send_message(chat_id, f"Не удалось показать предпросмотр: {html.escape(str(e))}")
@@ -3454,6 +3472,18 @@ PUB_VALUE_ASK = {
 async def pub_btn_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
     action = cb.data.split(":")[1]
     if action not in PUB_ACTIONS:
+        return await cb.answer()
+    if action == "dm":
+        uname = cb.from_user.username
+        if not uname:
+            return await cb.answer("Чтобы вам могли написать, задайте имя пользователя (@username) в настройках Telegram и выберите действие снова.",
+                                   show_alert=True)
+        await state.update_data(btn_action=action)
+        await cb.message.edit_text(
+            f"📩 <b>Переслать текст в личку</b>\n\nС помощью этой кнопки пользователи вашего канала отправят текст этого поста "
+            f"вам в личку (@{html.escape(uname)}).\n\nПри нажатии откроется чат с вами, а в поле ввода уже будет готово "
+            "сообщение «Здравствуйте! Хочу узнать об этом подробнее» и текст поста — останется нажать «Отправить».")
+        await pub_ask_color(bot, cb.message.chat.id, cb.from_user.id, state, {"payload": uname})
         return await cb.answer()
     await state.update_data(btn_action=action)
     if action == "like":
@@ -3828,7 +3858,7 @@ async def pub_edit_caption(m: Message, state: FSMContext, bot: Bot):
     text = m.html_text
     if len(text) > (4000 if post["kind"] == "text" else 1000):
         return await m.answer("Слишком длинный текст.")
-    markup = pub_build_markup(pub_post_items(pid))
+    markup = pub_build_markup([dict(b, post_text=text) for b in pub_post_items(pid)])
     pbot = pub_bot_by_id(bot, post["bot_id"] or 0)
     if pbot is None:
         await state.clear()
