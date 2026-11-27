@@ -16,6 +16,7 @@ Telegram-бот «Получить промт» (aiogram 3.x)
 
 Третий бот (озвучка голосами людей, диалоги, музыка) включается VOICE_BOT_TOKEN: ELEVEN_API_KEY, FIREBASE_URL,
 FIREBASE_SECRET, YADISK_TOKEN, VOICE_ADMIN_IDS — см. блок «ТРЕТИЙ БОТ».
+Голоса и модели Vui Labs (Luna-TTS): VUI_API_KEY (+ необязательно VUI_BASE_URL, VUI_TTS_MODEL).
 Тарифы бота озвучки: VOICE_FREE_CREDITS, VOICE_CHARS_PER_MIN, VOICE_MUSIC_CREDITS_PER_MIN, VOICE_COST_USD_PER_1K,
 VOICE_MARKUP, VOICE_USD_TJS, VOICE_PACKS, VOICE_PAY_PHONE.
 
@@ -4110,6 +4111,15 @@ YADISK_TOKEN = os.getenv("YADISK_TOKEN", "")  # OAuth-токен Яндекс.Д
 YADISK_DIR = "/" + os.getenv("YADISK_DIR", "VoiceBot").strip("/")
 VOICE_MAX_CHARS = int(os.getenv("VOICE_MAX_CHARS", "1500"))  # макс. символов текста за раз
 
+# ── Vui Labs (Luna-TTS): готовые и свои голоса, клонирование, дизайн голоса ──
+# Документация: https://doc.vuilabs.ai  (ключ — в заголовке X-API-Key). Работает ТОЛЬКО с текстом на en / zh / ja / ko.
+VUI_API_KEY = os.getenv("VUI_API_KEY", "")
+VUI_BASE_URL = os.getenv("VUI_BASE_URL", "https://api.vuilabs.ai").rstrip("/")
+VUI_TTS_MODEL = os.getenv("VUI_TTS_MODEL", "luna-tts-1.5")  # luna-tts-1.5 | luna-tts | luna-tts-character
+VUI_LANG = {"en": "English", "zh": "中文", "ja": "日本語", "ko": "한국어"}
+VUI_MODELS = [("luna-tts-1.5", "Luna-TTS 1.5"), ("luna-tts", "Luna-TTS (legacy)"), ("luna-tts-character", "Luna-TTS Character")]
+VUI_CHUNK = 470  # лимит API — 500 «взвешенных» символов на запрос (CJK/кана/хангыль = 2); берём с запасом
+
 # ── Тарифы и кредиты (внутри бот считает в «кредитах» = символы ElevenLabs, пользователю показывает минуты) ──
 VOICE_FREE_CREDITS = int(os.getenv("VOICE_FREE_CREDITS", "1000"))  # бесплатно новому пользователю (1 раз)
 VOICE_CHARS_PER_MIN = int(os.getenv("VOICE_CHARS_PER_MIN", "1000"))  # сколько символов ≈ 1 минута озвучки
@@ -4134,7 +4144,8 @@ VB_TTS, VB_DLG, VB_MUS, VB_PRJ = "🎙 Озвучка", "👥 Диалог", "�
 VB_STY = "🎧 Стиль по аудио"
 VB_ADD, VB_LIST = "➕ Добавить голос", "🗂 Голоса"
 VB_BAL, VB_BUY = "💰 Баланс", "💳 Тарифы"
-VO_MENU_BTNS = {VB_TTS, VB_DLG, VB_MUS, VB_STY, VB_PRJ, VB_ADD, VB_LIST, VB_BAL, VB_BUY}
+VB_VUI = "🌙 Vui Labs"
+VO_MENU_BTNS = {VB_TTS, VB_DLG, VB_MUS, VB_STY, VB_PRJ, VB_ADD, VB_LIST, VB_BAL, VB_BUY, VB_VUI}
 
 
 class VoAdd(StatesGroup):
@@ -4159,6 +4170,11 @@ class VoMus(StatesGroup):
 class VoSty(StatesGroup):
     audio = State()
     lyrics = State()
+
+
+class VoVui(StatesGroup):
+    design = State()
+    name = State()
 
 
 class VoBuy(StatesGroup):
@@ -4258,6 +4274,189 @@ async def el_music(prompt: str, ms: int, instrumental: bool) -> bytes:
     return body
 
 
+# ── Vui Labs API ──
+def _vh() -> dict:
+    return {"X-API-Key": VUI_API_KEY}
+
+
+def _vui_fail(st: int, body: bytes) -> RuntimeError:
+    try:
+        j = json.loads(body)
+        return RuntimeError(f"Vui Labs {st} / код {j.get('error_code')}: {j.get('error_message')}")
+    except Exception:
+        return RuntimeError(f"Vui Labs {st}: {body[:300].decode(errors='ignore')}")
+
+
+def _vui_data(st: int, body: bytes) -> dict:
+    # Ответ-конверт {succeed, error_code, data}. Бизнес-ошибка может прийти и с HTTP 200.
+    if st >= 400:
+        raise _vui_fail(st, body)
+    j = json.loads(body)
+    if j.get("succeed") is False or j.get("error_code"):
+        raise _vui_fail(st, body)
+    return j.get("data") or {}
+
+
+def vui_weight(text: str) -> int:
+    # «Вес» текста по правилам API: китайские/японские/корейские знаки = 2, остальное = 1, переводы строк = 0.
+    n = 0
+    for ch in text:
+        o = ord(ch)
+        if ch in "\r\n":
+            continue
+        if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0x20000 <= o <= 0x2FA1F
+                or 0x3040 <= o <= 0x30FF or 0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF
+                or 0x3130 <= o <= 0x318F or o == 0xFF70):
+            n += 2
+        else:
+            n += 1
+    return n
+
+
+def vui_chunks(text: str, limit: int = VUI_CHUNK) -> list:
+    # Режем текст по предложениям так, чтобы каждый кусок влезал в лимит одного запроса.
+    parts, cur = [], ""
+    for sent in re.split(r"(?<=[.!?。！？…\n])\s*", text.strip()):
+        if not sent:
+            continue
+        while vui_weight(sent) > limit:  # одно очень длинное предложение — режем по символам
+            head, acc = "", 0
+            for i, ch in enumerate(sent):
+                w = vui_weight(ch)
+                if acc + w > limit:
+                    break
+                head, acc = head + ch, acc + w
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(head)
+            sent = sent[len(head):]
+        sep = "" if cur and ord(cur[-1]) >= 0x3000 else " "  # между китайскими/японскими предложениями пробел не нужен
+        if cur and vui_weight(cur + sep + sent) > limit:
+            parts.append(cur)
+            cur = sent
+        else:
+            cur = (cur + sep + sent).strip()
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _wav_to_mp3(wav: bytes) -> bytes:
+    # Vui отдаёт WAV, а бот работает с mp3. Сначала ffmpeg, если его нет — пакет lameenc.
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-vn", "-f", "mp3", "-b:a", "128k", "pipe:1"],
+                           input=wav, capture_output=True, timeout=120)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+    except FileNotFoundError:
+        pass
+    try:
+        import wave
+        import lameenc
+    except ImportError:
+        raise RuntimeError("Для голосов Vui нужен ffmpeg на сервере или пакет lameenc (pip install lameenc).")
+    with wave.open(io.BytesIO(wav)) as w:
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(128)
+        enc.set_in_sample_rate(w.getframerate())
+        enc.set_channels(w.getnchannels())
+        enc.set_quality(2)
+        return bytes(enc.encode(w.readframes(w.getnframes())) + enc.flush())
+
+
+async def vui_tts(voice_id: str, text: str, model: str = "") -> bytes:
+    payload = {"text": text, "voice_id": voice_id, "model_id": model or VUI_TTS_MODEL}
+    st, body = await _http("POST", f"{VUI_BASE_URL}/v1/text-to-speech", timeout=180, json=payload, headers=_vh())
+    if st == 200 and body[:4] == b"RIFF":  # настоящее аудио; JSON-ошибка с кодом 200 сюда не попадёт
+        return body
+    raise _vui_fail(st, body)
+
+
+async def vui_speak(voice_id: str, text: str, model: str = "") -> bytes:
+    # Текст -> mp3 (кусками по лимиту API), чтобы дальше всё работало как с ElevenLabs.
+    out = []
+    for chunk in vui_chunks(text):
+        wav = await vui_tts(voice_id, chunk, model)
+        out.append(await asyncio.to_thread(_wav_to_mp3, wav))
+    if not out:
+        raise RuntimeError("Пустой текст")
+    return b"".join(out)
+
+
+async def vui_list_voices(source: str, model_id: str = "", max_items: int = 30) -> list:
+    items, cursor = [], ""
+    while len(items) < max_items:
+        params = {"source": source, "page_size": min(100, max_items - len(items))}
+        if model_id:
+            params["model_id"] = model_id
+        if cursor:
+            params["cursor"] = cursor
+        st, body = await _http("GET", f"{VUI_BASE_URL}/v1/voices", timeout=60, params=params, headers=_vh())
+        if st >= 400:
+            raise _vui_fail(st, body)
+        j = json.loads(body)
+        items += j.get("voices") or []
+        if not j.get("has_more") or not j.get("next_cursor"):
+            break
+        cursor = j["next_cursor"]
+    return items[:max_items]
+
+
+async def vui_upload(data: bytes, fname: str, mime: str) -> str:
+    form = aiohttp.FormData()
+    form.add_field("scene", "audio")
+    form.add_field("file", data, filename=fname, content_type=mime)
+    st, body = await _http("POST", f"{VUI_BASE_URL}/v1/files/upload", timeout=180, data=form, headers=_vh())
+    key = _vui_data(st, body).get("object_key")
+    if not key:
+        raise RuntimeError("Vui Labs не вернул object_key после загрузки аудио")
+    return key
+
+
+async def vui_clone(voice_id: str, object_key: str) -> None:
+    st, body = await _http("POST", f"{VUI_BASE_URL}/v1/voice/save", timeout=300,
+                           json={"voice_id": voice_id, "ref_audio": object_key}, headers=_vh())
+    _vui_data(st, body)
+
+
+async def vui_delete_voice(voice_id: str) -> None:
+    await _http("DELETE", f"{VUI_BASE_URL}/v1/voice/{quote(voice_id)}", headers=_vh())
+
+
+async def vui_design_generate(description: str) -> dict:
+    # НЕ идемпотентно: при таймауте не повторяем (каждый успешный раунд стоит $0.01 или бесплатную попытку).
+    st, body = await _http("POST", f"{VUI_BASE_URL}/api/tts/v1/voice-design/api/generate", timeout=120,
+                           json={"voiceDescription": description}, headers=_vh())
+    return _vui_data(st, body)
+
+
+async def vui_design_save(gen_id: str, no: int, name: str, lang: str, description: str) -> dict:
+    st, body = await _http("POST", f"{VUI_BASE_URL}/api/tts/v1/voice-design/api/save", timeout=120,
+                           json={"generationId": gen_id, "candidateNo": no, "name": name[:30],
+                                 "language": lang if lang in VUI_LANG else "en", "description": description[:200]},
+                           headers=_vh())
+    return _vui_data(st, body)
+
+
+_CYR = re.compile(r"[\u0400-\u052F]")
+
+
+def vo_text_problem(v: dict, text: str) -> str:
+    # Vui Labs не читает русский и таджикский — не списываем кредиты за заведомо неудачный запрос.
+    if v.get("provider") == "vui" and _CYR.search(text):
+        return ("⚠️ Голоса Vui Labs читают только английский, китайский, японский и корейский текст. "
+                "Для русского и тоҷикӣ выберите голос ElevenLabs.")
+    return ""
+
+
+async def vo_speak(v: dict, text: str) -> bytes:
+    # Единая точка озвучки: голос ElevenLabs или Vui Labs — на выходе всегда mp3.
+    if v.get("provider") == "vui":
+        return await vui_speak(v["vui_id"], text, v.get("vui_model", ""))
+    return await el_tts(v["el_id"], text, v.get("lang", ""))
+
+
 # ── Вспомогательное ──
 def vo_menu(uid: int) -> ReplyKeyboardMarkup:
     rows = [[KeyboardButton(text=VB_TTS), KeyboardButton(text=VB_DLG)],
@@ -4266,6 +4465,8 @@ def vo_menu(uid: int) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=VB_BUY)]]
     if uid in VOICE_ADMIN_IDS:
         rows.append([KeyboardButton(text=VB_ADD), KeyboardButton(text=VB_LIST)])
+        if VUI_API_KEY:
+            rows.append([KeyboardButton(text=VB_VUI)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -4277,7 +4478,9 @@ def vo_voice_kb(voices: dict, prefix: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for vid, v in voices.items():
         acc = f", {v['accent']}" if v.get("accent") else ""
-        b.button(text=f"🎙 {v['name']} · {VO_LANG.get(v.get('lang'), '')}{acc}", callback_data=f"{prefix}:{vid}")
+        icon = "🌙" if v.get("provider") == "vui" else "🎙"
+        lang = {**VO_LANG, **VUI_LANG}.get(v.get("lang"), "")
+        b.button(text=f"{icon} {v['name']} · {lang}{acc}", callback_data=f"{prefix}:{vid}")
     b.adjust(1)
     return b.as_markup()
 
@@ -4859,20 +5062,36 @@ async def vo_pay_no(c: CallbackQuery):
 @vo_router.message(F.text == VB_ADD, VO_ADMIN)
 async def vo_add_start(m: Message, state: FSMContext):
     await state.clear()
+    if not VUI_API_KEY:
+        await state.update_data(provider="el")
+        await state.set_state(VoAdd.name)
+        return await m.answer("Как назвать голос? (например: Рустам)")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎙 ElevenLabs (тоҷикӣ / русский)", callback_data="ap:el")
+    kb.button(text="🌙 Vui Labs (EN / 中文 / 日本語 / 한국어)", callback_data="ap:vui")
+    await m.answer("Где создать голос?", reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.callback_query(F.data.in_({"ap:el", "ap:vui"}), VO_ADMIN)
+async def vo_add_provider(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.update_data(provider=c.data[3:])
     await state.set_state(VoAdd.name)
-    await m.answer("Как назвать голос? (например: Рустам)")
+    await c.message.answer("Как назвать голос? (например: Рустам)")
+    await c.answer()
 
 
 @vo_router.message(VoAdd.name, F.text)
 async def vo_add_name(m: Message, state: FSMContext):
     await state.update_data(name=m.text.strip()[:40])
+    d = await state.get_data()
     kb = InlineKeyboardBuilder()
-    for k, v in VO_LANG.items():
+    for k, v in (VUI_LANG if d.get("provider") == "vui" else VO_LANG).items():
         kb.button(text=v, callback_data=f"al:{k}")
-    await m.answer("Язык голоса:", reply_markup=kb.adjust(3).as_markup())
+    await m.answer("Язык голоса:", reply_markup=kb.adjust(2 if d.get("provider") == "vui" else 3).as_markup())
 
 
-@vo_router.callback_query(F.data.regexp(r"^al:(tg|ru|mx)$"), VO_ADMIN)
+@vo_router.callback_query(F.data.regexp(r"^al:(tg|ru|mx|en|zh|ja|ko)$"), VO_ADMIN)
 async def vo_add_lang(c: CallbackQuery, state: FSMContext):
     await state.update_data(lang=c.data.split(":")[1])
     await state.set_state(VoAdd.accent)
@@ -4885,6 +5104,9 @@ async def vo_add_accent(m: Message, state: FSMContext):
     a = m.text.strip()
     await state.update_data(accent="" if a == "-" else a[:30], files=[])
     await state.set_state(VoAdd.audio)
+    if (await state.get_data()).get("provider") == "vui":
+        return await m.answer("Пришлите ОДНО аудио или голосовое: 3–60 секунд, чистая речь одного человека "
+                              "на английском, китайском, японском или корейском (до 20 МБ; mp3, wav, m4a, ogg, webm).")
     await m.answer("Пришлите голосовые/аудио этого человека (чище звук — лучше модель; желательно 1–3 минуты "
                    "без музыки и шума, файл до 20 МБ). Можно несколько файлов.")
 
@@ -4927,11 +5149,19 @@ async def vo_add_done(c: CallbackQuery, state: FSMContext):
                 p = f"{YADISK_DIR}/{vid}/{i}{ext}"
                 await yd_upload(p, data)
                 ypaths.append(p)
-        desc = f"{VO_LANG[d['lang']]} {d.get('accent', '')}".strip()
-        el_id = await el_clone(d["name"], samples, desc)
-        await fb("PUT", f"voices/{vid}", {"name": d["name"], "lang": d["lang"], "accent": d.get("accent", ""),
-                                          "el_id": el_id, "yadisk": f"{YADISK_DIR}/{vid}" if ypaths else "",
-                                          "created": int(time.time()), "by": c.from_user.id})
+        rec = {"name": d["name"], "lang": d["lang"], "accent": d.get("accent", ""),
+               "yadisk": f"{YADISK_DIR}/{vid}" if ypaths else "", "created": int(time.time()), "by": c.from_user.id}
+        if d.get("provider") == "vui":
+            fname, data, mime = samples[0]  # Vui клонирует по одной записи 3–60 с
+            if len(data) > 20 * 1024 * 1024:
+                raise RuntimeError("Файл больше 20 МБ — пришлите короче.")
+            vui_id = f"tj{vid}"
+            await vui_clone(vui_id, await vui_upload(data, fname, mime))
+            rec.update({"provider": "vui", "vui_id": vui_id, "vui_own": True, "vui_model": VUI_TTS_MODEL})
+        else:
+            desc = f"{VO_LANG[d['lang']]} {d.get('accent', '')}".strip()
+            rec["el_id"] = await el_clone(d["name"], samples, desc)
+        await fb("PUT", f"voices/{vid}", rec)
         await msg.edit_text(f"✅ Голос «{html.escape(d['name'])}» готов и доступен пользователям.")
     except Exception as e:
         await msg.edit_text(vo_fail(e))
@@ -4955,7 +5185,11 @@ async def vo_del(c: CallbackQuery):
     try:
         v = await fb("GET", f"voices/{vid}")
         if v:
-            await el_delete_voice(v["el_id"])
+            if v.get("provider") == "vui":
+                if v.get("vui_own") and VUI_API_KEY:  # импортированные голоса из аккаунта Vui не трогаем
+                    await vui_delete_voice(v["vui_id"])
+            else:
+                await el_delete_voice(v["el_id"])
             if v.get("yadisk") and YADISK_TOKEN:
                 await yd_delete(v["yadisk"])
             await fb("DELETE", f"voices/{vid}")
@@ -4963,6 +5197,176 @@ async def vo_del(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(vo_fail(e))
     await c.answer()
+
+
+# ── Админ: Vui Labs (импорт готовых/своих голосов, выбор модели, дизайн голоса) ──
+async def vo_vui_preview(msg: Message, url: str, caption: str, kb) -> None:
+    try:
+        st, body = await _http("GET", url, timeout=60)
+        if st != 200:
+            raise RuntimeError(f"preview {st}")
+        try:
+            mp3 = await asyncio.to_thread(_wav_to_mp3, body)
+            await msg.answer_audio(BufferedInputFile(mp3, filename="preview.mp3"), caption=caption, reply_markup=kb)
+        except Exception:
+            await msg.answer_document(BufferedInputFile(body, filename="preview.wav"), caption=caption, reply_markup=kb)
+    except Exception as e:
+        log.warning("превью Vui: %s", e)
+        await msg.answer(caption, reply_markup=kb)
+
+
+@vo_router.message(F.text == VB_VUI, VO_ADMIN)
+async def vo_vui_menu(m: Message, state: FSMContext):
+    await state.clear()
+    if not VUI_API_KEY:
+        return await m.answer("VUI_API_KEY не задан в переменных сервера.")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Импорт голосов из Vui", callback_data="vu:imp")
+    kb.button(text="🪄 Создать голос по описанию", callback_data="vu:design")
+    await m.answer("🌙 <b>Vui Labs</b>\n\nИмпорт — добавить в бот голоса из вашего аккаунта или из каталога "
+                   "(выбрав модель). Создать по описанию — голос из текстового описания, без записи.\n\n"
+                   "⚠️ Работает только с текстом на en / zh / ja / ko.", reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.callback_query(F.data == "vu:imp", VO_ADMIN)
+async def vo_vui_models(c: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    for mid, title in VUI_MODELS:
+        kb.button(text=title, callback_data=f"vm:{mid}")
+    await c.message.answer("Какую модель использовать?", reply_markup=kb.adjust(1).as_markup())
+    await c.answer()
+
+
+@vo_router.callback_query(F.data.startswith("vm:"), VO_ADMIN)
+async def vo_vui_source(c: CallbackQuery, state: FSMContext):
+    await state.update_data(vui_model=c.data[3:])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Мои голоса (аккаунт)", callback_data="vs:personal")
+    kb.button(text="⭐ Системные", callback_data="vs:system")
+    kb.button(text="🌐 Сообщество", callback_data="vs:community")
+    await c.message.answer("Откуда взять голоса?", reply_markup=kb.adjust(1).as_markup())
+    await c.answer()
+
+
+@vo_router.callback_query(F.data.startswith("vs:"), VO_ADMIN)
+async def vo_vui_list(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    model = d.get("vui_model") or VUI_TTS_MODEL
+    await c.answer()
+    try:
+        voices = await vui_list_voices(c.data[3:], model, 30)
+    except Exception as e:
+        return await c.message.answer(vo_fail(e))
+    if not voices:
+        return await c.message.answer("Для этой модели голосов не нашлось.")
+    items = [{"id": v["voice_id"], "name": v.get("name") or v["voice_id"], "lang": v.get("language") or "mx",
+              "prev": v.get("preview_url") or ""} for v in voices]
+    await state.update_data(vui_items=items)
+    kb = InlineKeyboardBuilder()
+    for i, it in enumerate(items):
+        kb.button(text=f"🌙 {it['name'][:30]} · {VUI_LANG.get(it['lang'], '')}", callback_data=f"vi:{i}")
+    await c.message.answer(f"Нашёл голосов: {len(items)}. Нажмите, чтобы послушать и добавить:",
+                           reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.callback_query(F.data.regexp(r"^vi:\d+$"), VO_ADMIN)
+async def vo_vui_pick(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    items = d.get("vui_items") or []
+    i = int(c.data[3:])
+    if i >= len(items):
+        return await c.answer("Список устарел — откройте заново", show_alert=True)
+    await c.answer()
+    it = items[i]
+    kb = InlineKeyboardBuilder().button(text="✅ Добавить в бот", callback_data=f"vk:{i}").as_markup()
+    if it["prev"]:
+        await vo_vui_preview(c.message, it["prev"], f"🌙 {it['name']}", kb)
+    else:
+        await c.message.answer(f"🌙 {it['name']} (превью нет)", reply_markup=kb)
+
+
+@vo_router.callback_query(F.data.regexp(r"^vk:\d+$"), VO_ADMIN)
+async def vo_vui_import(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    items = d.get("vui_items") or []
+    i = int(c.data[3:])
+    if i >= len(items):
+        return await c.answer("Список устарел — откройте заново", show_alert=True)
+    it = items[i]
+    try:
+        await fb("PUT", f"voices/{secrets.token_hex(4)}",
+                 {"name": it["name"][:40], "lang": it["lang"], "accent": "", "provider": "vui", "vui_id": it["id"],
+                  "vui_model": d.get("vui_model") or VUI_TTS_MODEL, "vui_own": False,
+                  "created": int(time.time()), "by": c.from_user.id})
+        await c.message.answer(f"✅ Голос «{html.escape(it['name'])}» добавлен и доступен пользователям.")
+    except Exception as e:
+        await c.message.answer(vo_fail(e))
+    await c.answer()
+
+
+@vo_router.callback_query(F.data == "vu:design", VO_ADMIN)
+async def vo_vui_design_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(VoVui.design)
+    await c.message.answer("Опишите голос одной-двумя фразами (до 200 символов), лучше на английском. Например:\n"
+                           "<code>Read in English. A warm adult female narrator with a clear, calm voice.</code>\n\n"
+                           "Вы получите 3 варианта. Нужна платная подписка Vui; один раунд = 1 бесплатная попытка "
+                           "или $0.01.")
+    await c.answer()
+
+
+@vo_router.message(VoVui.design, F.text, ~F.text.startswith("/"), ~F.text.in_(VO_MENU_BTNS))
+async def vo_vui_design_gen(m: Message, state: FSMContext):
+    desc = m.text.strip()
+    if len(desc) > 200:
+        return await m.answer("Описание длиннее 200 символов — сократите.")
+    wait = await m.answer("⏳ Создаю 3 варианта голоса, до минуты…")
+    try:
+        data = await vui_design_generate(desc)  # без повторов: каждая попытка тарифицируется
+    except Exception as e:
+        return await m.answer(vo_fail(e))
+    cands = data.get("candidates") or []
+    await state.update_data(gen_id=data.get("generationId"), desc=desc,
+                            langs={str(c["candidateNo"]): c.get("language", "en") for c in cands})
+    for cd in cands:
+        try:
+            st, body = await _http("GET", cd["previewUrl"], timeout=60)
+            mp3 = await asyncio.to_thread(_wav_to_mp3, body)
+            await m.answer_audio(BufferedInputFile(mp3, filename=f"variant{cd['candidateNo']}.mp3"),
+                                 caption=f"Вариант {cd['candidateNo']}")
+        except Exception as e:
+            log.warning("превью варианта: %s", e)
+    kb = InlineKeyboardBuilder()
+    for cd in cands:
+        kb.button(text=f"✅ Вариант {cd['candidateNo']}", callback_data=f"vg:{cd['candidateNo']}")
+    await wait.delete()
+    await m.answer("Какой вариант сохранить? (варианты доступны 3 часа)", reply_markup=kb.adjust(3).as_markup())
+
+
+@vo_router.callback_query(F.data.regexp(r"^vg:[123]$"), VO_ADMIN)
+async def vo_vui_design_pick(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if not d.get("gen_id"):
+        return await c.answer("Начните заново: «🌙 Vui Labs»", show_alert=True)
+    await state.update_data(pick=int(c.data[3:]))
+    await state.set_state(VoVui.name)
+    await c.message.answer("Как назвать голос? (до 30 символов, без эмодзи)")
+    await c.answer()
+
+
+@vo_router.message(VoVui.name, F.text, ~F.text.startswith("/"), ~F.text.in_(VO_MENU_BTNS))
+async def vo_vui_design_save(m: Message, state: FSMContext):
+    d = await state.get_data()
+    name = m.text.strip()[:30]
+    lang = d.get("langs", {}).get(str(d.get("pick")), "en")
+    try:
+        res = await vui_design_save(d["gen_id"], d["pick"], name, lang, d.get("desc", name))
+        await fb("PUT", f"voices/{secrets.token_hex(4)}",
+                 {"name": name, "lang": lang, "accent": "", "provider": "vui", "vui_id": res["savedVoiceId"],
+                  "vui_model": VUI_TTS_MODEL, "vui_own": True, "created": int(time.time()), "by": m.from_user.id})
+        await state.clear()
+        await m.answer(f"✅ Голос «{html.escape(name)}» создан и доступен пользователям.")
+    except Exception as e:  # сохранение идемпотентно: можно прислать другое имя и повторить
+        await m.answer(vo_fail(e) + "\n\nМожно прислать другое имя ещё раз.")
 
 
 # ── Озвучка текста ──
@@ -4998,6 +5402,9 @@ async def vo_tts_text(m: Message, state: FSMContext):
         v = await fb("GET", f"voices/{d['vid']}")
         if not v:
             return await m.answer("Этот голос удалён, выберите другой.")
+        bad = vo_text_problem(v, text)
+        if bad:
+            return await m.answer(bad)
         need = len(text)
         ok, w = await vo_charge(uid, need)
         if not ok:
@@ -5005,7 +5412,7 @@ async def vo_tts_text(m: Message, state: FSMContext):
         wait = await m.answer("⏳ Озвучиваю…")
         try:
             async with _VO_SEM:
-                audio = await el_tts(v["el_id"], text, v.get("lang", ""))
+                audio = await vo_speak(v, text)
             await vo_send(m, audio, f"{v['name']}: {text}", "tts", {"voice": v["name"], "text": text[:300]})
         except Exception:
             await vo_refund(uid, need)  # не получилось — кредиты возвращаем
@@ -5086,6 +5493,10 @@ async def vo_dlg_script(m: Message, state: FSMContext):
         voices = {vid: await fb("GET", f"voices/{vid}") for vid in set(d["picked"])}
         if any(v is None for v in voices.values()):
             return await m.answer("Один из голосов удалён — начните заново.")
+        for who, text in lines:
+            bad = vo_text_problem(voices[d["picked"][who - 1]], text)
+            if bad:
+                return await m.answer(bad)
         need = sum(len(t) for _, t in lines)
         ok, w = await vo_charge(uid, need)
         if not ok:
@@ -5096,7 +5507,7 @@ async def vo_dlg_script(m: Message, state: FSMContext):
             async with _VO_SEM:
                 for who, text in lines:
                     v = voices[d["picked"][who - 1]]
-                    parts.append(await el_tts(v["el_id"], text, v.get("lang", "")))
+                    parts.append(await vo_speak(v, text))
             await vo_send(m, b"".join(parts), f"Диалог {d['n']} чел.", "dialog", {"text": m.text[:300]})
         except Exception:
             await vo_refund(uid, need)
@@ -5284,6 +5695,7 @@ async def run_voice() -> None:
         for name, val in (("ELEVEN_API_KEY", ELEVEN_API_KEY), ("FIREBASE_URL", FIREBASE_URL), ("YADISK_TOKEN", YADISK_TOKEN)):
             if not val:
                 log.warning("бот озвучки: не задан %s", name)
+        log.info("Vui Labs: %s", "ключ задан" if VUI_API_KEY else "VUI_API_KEY не задан — голоса Vui отключены")
         log.info("Бот озвучки @%s запущен", me.username)
         try:
             await dp.start_polling(vbot, handle_signals=False)
