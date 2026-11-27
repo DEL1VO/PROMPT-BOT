@@ -1,3 +1,6 @@
 aiogram>=3.25,<4
 python-dotenv>=1.0
 cryptography>=42
+librosa
+numpy
+soundfile
