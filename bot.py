@@ -17,6 +17,7 @@ Telegram-бот «Получить промт» (aiogram 3.x)
 Третий бот (озвучка голосами людей, диалоги, музыка) включается VOICE_BOT_TOKEN: ELEVEN_API_KEY, FIREBASE_URL,
 FIREBASE_SECRET, YADISK_TOKEN, VOICE_ADMIN_IDS — см. блок «ТРЕТИЙ БОТ».
 Голоса и модели Vui Labs (Luna-TTS): VUI_API_KEY (+ необязательно VUI_BASE_URL, VUI_TTS_MODEL).
+Голоса Giggy.ai (230+ языков, в т.ч. тоҷикӣ и русский): GIGGY_API_KEY (+ необязательно GIGGY_MODE=fast|batch, GIGGY_BASE_URL).
 Тарифы бота озвучки: VOICE_FREE_CREDITS, VOICE_CHARS_PER_MIN, VOICE_MUSIC_CREDITS_PER_MIN, VOICE_COST_USD_PER_1K,
 VOICE_MARKUP, VOICE_USD_TJS, VOICE_PACKS, VOICE_PAY_PHONE.
 
@@ -4120,6 +4121,14 @@ VUI_LANG = {"en": "English", "zh": "中文", "ja": "日本語", "ko": "한국어
 VUI_MODELS = [("luna-tts-1.5", "Luna-TTS 1.5"), ("luna-tts", "Luna-TTS (legacy)"), ("luna-tts-character", "Luna-TTS Character")]
 VUI_CHUNK = 470  # лимит API — 500 «взвешенных» символов на запрос (CJK/кана/хангыль = 2); берём с запасом
 
+# ── Giggy.ai: озвучка на 230+ языках (есть тоҷикӣ и русский) ──
+# Документация: https://giggy.ai/docs/speech-api ; ключ giggy_sk_... передаётся в заголовке xi-api-key.
+# ВАЖНО: клонирования и дизайна голоса через API у Giggy нет — клоны создаются на сайте giggy.ai и появляются в «Мои голоса».
+GIGGY_API_KEY = os.getenv("GIGGY_API_KEY", "")
+GIGGY_BASE_URL = os.getenv("GIGGY_BASE_URL", "https://api.giggy.ai/v1").rstrip("/")
+GIGGY_MODE = os.getenv("GIGGY_MODE", "fast").strip().lower()  # fast — платно и быстро; batch — бесплатно, но медленнее и до 1250 символов
+GIGGY_CHUNK = 1200 if GIGGY_MODE == "batch" else 4000  # символов на один запрос
+
 # ── Тарифы и кредиты (внутри бот считает в «кредитах» = символы ElevenLabs, пользователю показывает минуты) ──
 VOICE_FREE_CREDITS = int(os.getenv("VOICE_FREE_CREDITS", "1000"))  # бесплатно новому пользователю (1 раз)
 VOICE_CHARS_PER_MIN = int(os.getenv("VOICE_CHARS_PER_MIN", "1000"))  # сколько символов ≈ 1 минута озвучки
@@ -4145,7 +4154,8 @@ VB_STY = "🎧 Стиль по аудио"
 VB_ADD, VB_LIST = "➕ Добавить голос", "🗂 Голоса"
 VB_BAL, VB_BUY = "💰 Баланс", "💳 Тарифы"
 VB_VUI = "🌙 Vui Labs"
-VO_MENU_BTNS = {VB_TTS, VB_DLG, VB_MUS, VB_STY, VB_PRJ, VB_ADD, VB_LIST, VB_BAL, VB_BUY, VB_VUI}
+VB_GIG = "🎀 Giggy"
+VO_MENU_BTNS = {VB_TTS, VB_DLG, VB_MUS, VB_STY, VB_PRJ, VB_ADD, VB_LIST, VB_BAL, VB_BUY, VB_VUI, VB_GIG}
 
 
 class VoAdd(StatesGroup):
@@ -4170,6 +4180,10 @@ class VoMus(StatesGroup):
 class VoSty(StatesGroup):
     audio = State()
     lyrics = State()
+
+
+class VoGig(StatesGroup):
+    query = State()
 
 
 class VoVui(StatesGroup):
@@ -4313,16 +4327,17 @@ def vui_weight(text: str) -> int:
     return n
 
 
-def vui_chunks(text: str, limit: int = VUI_CHUNK) -> list:
+def vui_chunks(text: str, limit: int = VUI_CHUNK, weight=None) -> list:
+    weight = weight or vui_weight
     # Режем текст по предложениям так, чтобы каждый кусок влезал в лимит одного запроса.
     parts, cur = [], ""
     for sent in re.split(r"(?<=[.!?。！？…\n])\s*", text.strip()):
         if not sent:
             continue
-        while vui_weight(sent) > limit:  # одно очень длинное предложение — режем по символам
+        while weight(sent) > limit:  # одно очень длинное предложение — режем по символам
             head, acc = "", 0
             for i, ch in enumerate(sent):
-                w = vui_weight(ch)
+                w = weight(ch)
                 if acc + w > limit:
                     break
                 head, acc = head + ch, acc + w
@@ -4332,7 +4347,7 @@ def vui_chunks(text: str, limit: int = VUI_CHUNK) -> list:
             parts.append(head)
             sent = sent[len(head):]
         sep = "" if cur and ord(cur[-1]) >= 0x3000 else " "  # между китайскими/японскими предложениями пробел не нужен
-        if cur and vui_weight(cur + sep + sent) > limit:
+        if cur and weight(cur + sep + sent) > limit:
             parts.append(cur)
             cur = sent
         else:
@@ -4452,9 +4467,85 @@ def vo_text_problem(v: dict, text: str) -> str:
 
 async def vo_speak(v: dict, text: str) -> bytes:
     # Единая точка озвучки: голос ElevenLabs или Vui Labs — на выходе всегда mp3.
+    if v.get("provider") == "giggy":
+        return await giggy_speak(v["giggy_id"], text)
     if v.get("provider") == "vui":
         return await vui_speak(v["vui_id"], text, v.get("vui_model", ""))
     return await el_tts(v["el_id"], text, v.get("lang", ""))
+
+
+# ── Giggy API ──
+def _gh() -> dict:
+    return {"xi-api-key": GIGGY_API_KEY}
+
+
+def _giggy_fail(st: int, body: bytes) -> RuntimeError:
+    try:
+        d = json.loads(body).get("detail")
+        if isinstance(d, dict):
+            return RuntimeError(f"Giggy {st} / {d.get('code')}: {d.get('message')}")
+        return RuntimeError(f"Giggy {st}: {d}")
+    except Exception:
+        return RuntimeError(f"Giggy {st}: {body[:300].decode(errors='ignore')}")
+
+
+async def giggy_tts(voice_id: str, text: str) -> bytes:
+    payload = {"text": text, "voice_id": voice_id, "mode": GIGGY_MODE, "output_format": "mp3_24000_160"}
+    headers = {**_gh(), "Idempotency-Key": secrets.token_hex(16)}  # автоповторов нет: каждый запрос — отдельная операция
+    st, body = await _http("POST", f"{GIGGY_BASE_URL}/text-to-speech", timeout=300, json=payload, headers=headers)
+    if st == 200 and body[:1] != b"{":  # настоящий mp3, а не JSON-ошибка
+        return body
+    raise _giggy_fail(st, body)
+
+
+async def giggy_speak(voice_id: str, text: str) -> bytes:
+    # Giggy сразу отдаёт mp3, конвертация не нужна. Длинный текст режем по предложениям.
+    out = []
+    for chunk in vui_chunks(text, GIGGY_CHUNK, len):
+        out.append(await giggy_tts(voice_id, chunk))
+    if not out:
+        raise RuntimeError("Пустой текст")
+    return b"".join(out)
+
+
+async def giggy_list_voices(kind: str, language: str = "", q: str = "", max_items: int = 40) -> list:
+    # kind: "mine" — свои голоса (клоны/дизайн из аккаунта), "public" — общий каталог (поиск по языку или названию)
+    items, offset = [], 0
+    while len(items) < max_items:
+        params = {"limit": 20, "offset": offset}
+        if kind == "public":
+            if language:
+                params["language"] = language
+            if q:
+                params["q"] = q
+        st, body = await _http("GET", f"{GIGGY_BASE_URL}/{'my-voices' if kind == 'mine' else 'voices'}",
+                               timeout=60, params=params, headers=_gh())
+        if st >= 400:
+            raise _giggy_fail(st, body)
+        page = json.loads(body).get("voices") or []
+        items += page
+        if len(page) < 20:
+            break
+        offset += 20
+    return items[:max_items]
+
+
+async def giggy_balance() -> int:
+    st, body = await _http("GET", f"{GIGGY_BASE_URL}/credits/balance", timeout=30, headers=_gh())
+    if st >= 400:
+        raise _giggy_fail(st, body)
+    return int(json.loads(body)["credit_balance"])
+
+
+def giggy_lang_code(labels) -> str:
+    # язык из меток голоса -> наши коды (tg / ru / mx = другой)
+    labels = labels or {}
+    t = str(labels.get("language") or labels.get("lang") or "").lower()
+    if "taj" in t or t == "tg":
+        return "tg"
+    if "rus" in t or t == "ru":
+        return "ru"
+    return "mx"
 
 
 # ── Вспомогательное ──
@@ -4465,8 +4556,9 @@ def vo_menu(uid: int) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=VB_BUY)]]
     if uid in VOICE_ADMIN_IDS:
         rows.append([KeyboardButton(text=VB_ADD), KeyboardButton(text=VB_LIST)])
-        if VUI_API_KEY:
-            rows.append([KeyboardButton(text=VB_VUI)])
+        extra = ([KeyboardButton(text=VB_VUI)] if VUI_API_KEY else []) + ([KeyboardButton(text=VB_GIG)] if GIGGY_API_KEY else [])
+        if extra:
+            rows.append(extra)
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -4478,7 +4570,7 @@ def vo_voice_kb(voices: dict, prefix: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for vid, v in voices.items():
         acc = f", {v['accent']}" if v.get("accent") else ""
-        icon = "🌙" if v.get("provider") == "vui" else "🎙"
+        icon = {"vui": "🌙", "giggy": "🎀"}.get(v.get("provider"), "🎙")
         lang = {**VO_LANG, **VUI_LANG}.get(v.get("lang"), "")
         b.button(text=f"{icon} {v['name']} · {lang}{acc}", callback_data=f"{prefix}:{vid}")
     b.adjust(1)
@@ -5062,14 +5154,26 @@ async def vo_pay_no(c: CallbackQuery):
 @vo_router.message(F.text == VB_ADD, VO_ADMIN)
 async def vo_add_start(m: Message, state: FSMContext):
     await state.clear()
-    if not VUI_API_KEY:
+    if not (VUI_API_KEY or GIGGY_API_KEY):
         await state.update_data(provider="el")
         await state.set_state(VoAdd.name)
         return await m.answer("Как назвать голос? (например: Рустам)")
     kb = InlineKeyboardBuilder()
     kb.button(text="🎙 ElevenLabs (тоҷикӣ / русский)", callback_data="ap:el")
-    kb.button(text="🌙 Vui Labs (EN / 中文 / 日本語 / 한국어)", callback_data="ap:vui")
+    if VUI_API_KEY:
+        kb.button(text="🌙 Vui Labs (EN / 中文 / 日本語 / 한국어)", callback_data="ap:vui")
+    if GIGGY_API_KEY:
+        kb.button(text="🎀 Giggy (230+ языков, в т.ч. тоҷикӣ)", callback_data="ap:giggy")
     await m.answer("Где создать голос?", reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.callback_query(F.data == "ap:giggy", VO_ADMIN)
+async def vo_add_giggy(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.answer("В Giggy голоса клонируются на сайте giggy.ai (Voice Clone или Voice Design, 1000 кредитов "
+                           "за голос) — через API это недоступно. Создайте голос там, затем откройте "
+                           "«🎀 Giggy → Мои голоса» и добавьте его в бот.")
+    await c.answer()
 
 
 @vo_router.callback_query(F.data.in_({"ap:el", "ap:vui"}), VO_ADMIN)
@@ -5188,6 +5292,8 @@ async def vo_del(c: CallbackQuery):
             if v.get("provider") == "vui":
                 if v.get("vui_own") and VUI_API_KEY:  # импортированные голоса из аккаунта Vui не трогаем
                     await vui_delete_voice(v["vui_id"])
+            elif v.get("provider") == "giggy":
+                pass  # убираем только из бота; в аккаунте Giggy голос остаётся
             else:
                 await el_delete_voice(v["el_id"])
             if v.get("yadisk") and YADISK_TOKEN:
@@ -5206,7 +5312,8 @@ async def vo_vui_preview(msg: Message, url: str, caption: str, kb) -> None:
         if st != 200:
             raise RuntimeError(f"preview {st}")
         try:
-            mp3 = await asyncio.to_thread(_wav_to_mp3, body)
+            is_mp3 = body[:3] == b"ID3" or body[:1] == b"\xff"
+            mp3 = body if is_mp3 else await asyncio.to_thread(_wav_to_mp3, body)
             await msg.answer_audio(BufferedInputFile(mp3, filename="preview.mp3"), caption=caption, reply_markup=kb)
         except Exception:
             await msg.answer_document(BufferedInputFile(body, filename="preview.wav"), caption=caption, reply_markup=kb)
@@ -5367,6 +5474,99 @@ async def vo_vui_design_save(m: Message, state: FSMContext):
         await m.answer(f"✅ Голос «{html.escape(name)}» создан и доступен пользователям.")
     except Exception as e:  # сохранение идемпотентно: можно прислать другое имя и повторить
         await m.answer(vo_fail(e) + "\n\nМожно прислать другое имя ещё раз.")
+
+
+# ── Админ: Giggy (импорт голосов, поиск, баланс) ──
+async def vo_gig_show(msg: Message, state: FSMContext, kind: str, language: str = "", q: str = "") -> None:
+    try:
+        voices = await giggy_list_voices(kind, language, q)
+        if not voices and language:  # формат фильтра языка мог не подойти — пробуем как поиск по слову
+            voices = await giggy_list_voices(kind, "", language)
+    except Exception as e:
+        return await msg.answer(vo_fail(e))
+    if not voices:
+        return await msg.answer("Ничего не нашлось.")
+    items = []
+    for v in voices:
+        lb = v.get("labels") or {}
+        items.append({"id": v["voice_id"], "name": v.get("name") or v["voice_id"][:8],
+                      "lang": giggy_lang_code(lb), "accent": str(lb.get("accent") or "")[:30],
+                      "prev": v.get("preview_url") or ""})
+    await state.update_data(gig_items=items)
+    kb = InlineKeyboardBuilder()
+    for i, it in enumerate(items):
+        kb.button(text=f"🎀 {it['name'][:30]} · {VO_LANG.get(it['lang'], '')}", callback_data=f"gi:{i}")
+    await msg.answer(f"Нашёл голосов: {len(items)}. Нажмите, чтобы послушать и добавить:",
+                     reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.message(F.text == VB_GIG, VO_ADMIN)
+async def vo_gig_menu(m: Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Мои голоса (клоны из аккаунта)", callback_data="gm:mine")
+    kb.button(text="Публичные: тоҷикӣ", callback_data="gm:Tajik")
+    kb.button(text="Публичные: русский", callback_data="gm:Russian")
+    kb.button(text="🔎 Поиск по названию", callback_data="gm:search")
+    kb.button(text="💳 Баланс Giggy", callback_data="gm:bal")
+    await m.answer("🎀 <b>Giggy</b>\n\nИмпорт голосов в бот. Клонировать голос можно на сайте giggy.ai — "
+                   "после этого он появится в «Мои голоса».", reply_markup=kb.adjust(1).as_markup())
+
+
+@vo_router.callback_query(F.data.startswith("gm:"), VO_ADMIN)
+async def vo_gig_menu_cb(c: CallbackQuery, state: FSMContext):
+    act = c.data[3:]
+    await c.answer()
+    if act == "bal":
+        try:
+            n = await giggy_balance()
+            return await c.message.answer(f"💳 Баланс Giggy: <b>{n:,}</b> кредитов".replace(",", " "))
+        except Exception as e:
+            return await c.message.answer(vo_fail(e))
+    if act == "search":
+        await state.set_state(VoGig.query)
+        return await c.message.answer("Введите слово для поиска (имя голоса, язык, акцент):")
+    if act == "mine":
+        return await vo_gig_show(c.message, state, "mine")
+    await vo_gig_show(c.message, state, "public", language=act)
+
+
+@vo_router.message(VoGig.query, F.text, ~F.text.startswith("/"), ~F.text.in_(VO_MENU_BTNS))
+async def vo_gig_search(m: Message, state: FSMContext):
+    await state.set_state(None)
+    await vo_gig_show(m, state, "public", q=m.text.strip()[:80])
+
+
+@vo_router.callback_query(F.data.regexp(r"^gi:\d+$"), VO_ADMIN)
+async def vo_gig_pick(c: CallbackQuery, state: FSMContext):
+    items = (await state.get_data()).get("gig_items") or []
+    i = int(c.data[3:])
+    if i >= len(items):
+        return await c.answer("Список устарел — откройте заново", show_alert=True)
+    await c.answer()
+    it = items[i]
+    kb = InlineKeyboardBuilder().button(text="✅ Добавить в бот", callback_data=f"gk:{i}").as_markup()
+    if it["prev"]:
+        await vo_vui_preview(c.message, it["prev"], f"🎀 {it['name']}", kb)
+    else:
+        await c.message.answer(f"🎀 {it['name']} (превью нет)", reply_markup=kb)
+
+
+@vo_router.callback_query(F.data.regexp(r"^gk:\d+$"), VO_ADMIN)
+async def vo_gig_import(c: CallbackQuery, state: FSMContext):
+    items = (await state.get_data()).get("gig_items") or []
+    i = int(c.data[3:])
+    if i >= len(items):
+        return await c.answer("Список устарел — откройте заново", show_alert=True)
+    it = items[i]
+    try:
+        await fb("PUT", f"voices/{secrets.token_hex(4)}",
+                 {"name": it["name"][:40], "lang": it["lang"], "accent": it["accent"], "provider": "giggy",
+                  "giggy_id": it["id"], "created": int(time.time()), "by": c.from_user.id})
+        await c.message.answer(f"✅ Голос «{html.escape(it['name'])}» добавлен и доступен пользователям.")
+    except Exception as e:
+        await c.message.answer(vo_fail(e))
+    await c.answer()
 
 
 # ── Озвучка текста ──
@@ -5695,6 +5895,7 @@ async def run_voice() -> None:
         for name, val in (("ELEVEN_API_KEY", ELEVEN_API_KEY), ("FIREBASE_URL", FIREBASE_URL), ("YADISK_TOKEN", YADISK_TOKEN)):
             if not val:
                 log.warning("бот озвучки: не задан %s", name)
+        log.info("Giggy: %s (режим %s)", "ключ задан" if GIGGY_API_KEY else "GIGGY_API_KEY не задан — голоса Giggy отключены", GIGGY_MODE)
         log.info("Vui Labs: %s", "ключ задан" if VUI_API_KEY else "VUI_API_KEY не задан — голоса Vui отключены")
         log.info("Бот озвучки @%s запущен", me.username)
         try:
