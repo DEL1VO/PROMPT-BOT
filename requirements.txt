@@ -1,6 +1,8 @@
 aiogram>=3.25,<4
+aiohttp>=3.9
 python-dotenv>=1.0
 cryptography>=42
-librosa
-numpy
-soundfile
+numpy>=1.26
+librosa>=0.10
+soundfile>=0.12
+lameenc>=1.7
